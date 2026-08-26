@@ -669,7 +669,6 @@ export interface Account {
 	expiresAt: number;
 	accountId?: string;
 	lastUsed?: number;
-	quotaExhaustedUntil?: number;
 }
 
 interface StorageData {
@@ -677,17 +676,54 @@ interface StorageData {
 	activeEmail?: string;
 }
 
+function normalizeStorageData(value: unknown): StorageData {
+	const raw = (value ?? {}) as Partial<StorageData>;
+	const accounts = Array.isArray(raw.accounts)
+		? raw.accounts.map((value) => {
+				const { quotaExhaustedUntil: _legacyQuotaFlag, ...account } =
+					value as Account & { quotaExhaustedUntil?: unknown };
+				return account;
+			})
+		: [];
+	return {
+		accounts,
+		...(typeof raw.activeEmail === "string"
+			? { activeEmail: raw.activeEmail }
+			: {}),
+	};
+}
+
 const STORAGE_FILE = path.join(os.homedir(), ".pi", "agent", "multicodex.json");
 const PROVIDER_ID = "multicodex";
 const BASE_CODEX_API = "openai-codex-responses" as const;
 const MULTICODEX_API = "multicodex-codex-responses" as const;
 type MulticodexApi = typeof MULTICODEX_API;
-const QUOTA_COOLDOWN_MS = 60 * 60 * 1000; // 1 hour
-
 type WarningHandler = (message: string) => void;
 
-function isAccountAvailable(account: Account, now: number): boolean {
-	return !account.quotaExhaustedUntil || account.quotaExhaustedUntil <= now;
+/**
+ * Quota is authoritative server state. Do not persist a local "exhausted"
+ * marker: the 5-hour and weekly windows can reset independently.
+ */
+export function isUsageQuotaExhausted(
+	usage?: CodexUsageSnapshot,
+	now = Date.now(),
+): boolean {
+	return [usage?.primary, usage?.secondary].some((window) => {
+		if (window?.usedPercent === undefined || window.usedPercent < 100) {
+			return false;
+		}
+		// A reset in the past means the snapshot has expired. The caller will
+		// refresh stale snapshots before automatic account selection.
+		return window.resetAt === undefined || window.resetAt > now;
+	});
+}
+
+function isAccountAvailable(
+	account: Account,
+	usageByEmail: Map<string, CodexUsageSnapshot>,
+	now: number,
+): boolean {
+	return !isUsageQuotaExhausted(usageByEmail.get(account.email), now);
 }
 
 function pickRandomAccount(accounts: Account[]): Account | undefined {
@@ -721,7 +757,7 @@ export function pickBestAccount(
 	const now = options?.now ?? Date.now();
 	const available = accounts.filter(
 		(account) =>
-			isAccountAvailable(account, now) &&
+			isAccountAvailable(account, usageByEmail, now) &&
 			!options?.excludeEmails?.has(account.email),
 	);
 	if (available.length === 0) return undefined;
@@ -768,11 +804,11 @@ export class AccountManager {
 		try {
 			const storageFile = getMulticodexStorageFile();
 			if (fs.existsSync(storageFile)) {
-				const data = JSON.parse(
-					fs.readFileSync(storageFile, "utf-8"),
-				) as StorageData;
+				const data = normalizeStorageData(
+					JSON.parse(fs.readFileSync(storageFile, "utf-8")),
+				);
 				logMulticodex("storage.load.success", {
-					accounts: data.accounts?.length ?? 0,
+					accounts: data.accounts.length,
 					activeEmail: data.activeEmail,
 				});
 				return data;
@@ -790,7 +826,10 @@ export class AccountManager {
 			const storageFile = getMulticodexStorageFile();
 			const dir = path.dirname(storageFile);
 			if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
-			fs.writeFileSync(storageFile, JSON.stringify(this.data, null, 2));
+			fs.writeFileSync(
+				storageFile,
+				JSON.stringify(normalizeStorageData(this.data), null, 2),
+			);
 			logMulticodex("storage.save.success", {
 				accounts: this.data.accounts.map((account) => ({
 					email: account.email,
@@ -874,11 +913,10 @@ export class AccountManager {
 		excludeEmails?: Set<string>;
 	}): Account | undefined {
 		const now = options?.now ?? Date.now();
-		this.clearExpiredExhaustion(now);
 		const manual = this.getManualAccount();
 		if (!manual) return undefined;
 		if (options?.excludeEmails?.has(manual.email)) return undefined;
-		if (!isAccountAvailable(manual, now)) return undefined;
+		if (!isAccountAvailable(manual, this.usageCache, now)) return undefined;
 		return manual;
 	}
 
@@ -910,17 +948,6 @@ export class AccountManager {
 			logMulticodex("account.manual.clear", { email: this.manualEmail });
 		}
 		this.manualEmail = undefined;
-	}
-
-	markExhausted(email: string, until: number): void {
-		const account = this.getAccount(email);
-		if (account) {
-			account.quotaExhaustedUntil = until;
-			this.save();
-			logMulticodex("account.quota.mark_exhausted", { email, until });
-		} else {
-			logMulticodex("account.quota.mark_exhausted_missing", { email, until });
-		}
 	}
 
 	getCachedUsage(email: string): CodexUsageSnapshot | undefined {
@@ -1015,7 +1042,6 @@ export class AccountManager {
 		signal?: AbortSignal;
 	}): Promise<Account | undefined> {
 		const now = Date.now();
-		this.clearExpiredExhaustion(now);
 		const accounts = this.data.accounts;
 		await this.refreshUsageIfStale(accounts, options);
 
@@ -1047,23 +1073,14 @@ export class AccountManager {
 			force: true,
 			signal: options?.signal,
 		});
-		const now = Date.now();
-		const resetAt = getNextResetAt(usage);
-		const fallback = now + QUOTA_COOLDOWN_MS;
-		const until = resetAt && resetAt > now ? resetAt : fallback;
-		this.markExhausted(account.email, until);
-	}
-
-	private clearExpiredExhaustion(now: number): void {
-		let changed = false;
-		for (const account of this.data.accounts) {
-			if (account.quotaExhaustedUntil && account.quotaExhaustedUntil <= now) {
-				account.quotaExhaustedUntil = undefined;
-				changed = true;
-			}
-		}
-		if (changed) {
-			this.save();
+		// The forced refresh above updates the authoritative 5-hour/weekly
+		// windows. Selection will use those values on the next attempt.
+		if (usage && isUsageQuotaExhausted(usage, Date.now())) {
+			logMulticodex("account.quota.server_exhausted", {
+				email: account.email,
+				primaryUsedPercent: usage.primary?.usedPercent,
+				secondaryUsedPercent: usage.secondary?.usedPercent,
+			});
 		}
 	}
 
@@ -1075,9 +1092,9 @@ export class AccountManager {
 		try {
 			const storageFile = getMulticodexStorageFile();
 			if (!fs.existsSync(storageFile)) return false;
-			this.data = JSON.parse(
-				fs.readFileSync(storageFile, "utf-8"),
-			) as StorageData;
+			this.data = normalizeStorageData(
+				JSON.parse(fs.readFileSync(storageFile, "utf-8")),
+			);
 			logMulticodex("storage.reload.success", {
 				accounts: this.data.accounts.length,
 				activeEmail: this.data.activeEmail,
@@ -1096,7 +1113,6 @@ export class AccountManager {
 		target.expiresAt = source.expiresAt;
 		target.accountId = source.accountId;
 		target.lastUsed = source.lastUsed;
-		target.quotaExhaustedUntil = source.quotaExhaustedUntil;
 	}
 
 	private getOrAttachAccount(account: Account): Account {
@@ -1509,9 +1525,7 @@ export default function multicodexExtension(pi: ExtensionAPI) {
 			const options = accounts.map((account) => {
 				const usage = accountManager.getCachedUsage(account.email);
 				const isActive = active?.email === account.email;
-				const quotaHit =
-					account.quotaExhaustedUntil &&
-					account.quotaExhaustedUntil > Date.now();
+				const quotaHit = isUsageQuotaExhausted(usage, Date.now());
 				const untouched = isUsageUntouched(usage) ? "untouched" : null;
 				const tags = [
 					isActive ? "active" : null,

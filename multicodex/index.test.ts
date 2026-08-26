@@ -21,6 +21,7 @@ import {
 	getOpenAICodexMirror,
 	getWeeklyResetAt,
 	isQuotaErrorMessage,
+	isUsageQuotaExhausted,
 	isUsageUntouched,
 	parseCodexUsageResponse,
 	pickBestAccount,
@@ -503,6 +504,42 @@ describe("usage helpers", () => {
 	});
 });
 
+describe("quota state", () => {
+	it("derives exhaustion from the active 5-hour or weekly window", () => {
+		const now = 10_000;
+		expect(
+			isUsageQuotaExhausted(
+				{
+					primary: { usedPercent: 100, resetAt: now + 1_000 },
+					secondary: { usedPercent: 20, resetAt: now + 2_000 },
+					fetchedAt: now,
+				},
+				now,
+			),
+		).toBe(true);
+		expect(
+			isUsageQuotaExhausted(
+				{
+					primary: { usedPercent: 100, resetAt: now - 1_000 },
+					secondary: { usedPercent: 20, resetAt: now + 2_000 },
+					fetchedAt: now,
+				},
+				now,
+			),
+		).toBe(false);
+		expect(
+			isUsageQuotaExhausted(
+				{
+					primary: { usedPercent: 20 },
+					secondary: { usedPercent: 100, resetAt: now + 2_000 },
+					fetchedAt: now,
+				},
+				now,
+			),
+		).toBe(true);
+	});
+});
+
 describe("pickBestAccount", () => {
 	it("prefers untouched accounts when available", () => {
 		const accounts = [makeAccount("a"), makeAccount("b")];
@@ -585,17 +622,14 @@ describe("pickBestAccount", () => {
 		expect(["a", "b"]).toContain(selected?.email);
 	});
 
-	it("ignores exhausted accounts", () => {
-		const accounts = [
-			makeAccount("a", { quotaExhaustedUntil: 2000 }),
-			makeAccount("b"),
-		];
+	it("ignores accounts whose server-reported window is exhausted", () => {
+		const accounts = [makeAccount("a"), makeAccount("b")];
 		const usage = new Map([
 			[
 				"a",
 				{
-					primary: { usedPercent: 0, resetAt: 1000 },
-					secondary: { usedPercent: 0, resetAt: 1000 },
+					primary: { usedPercent: 100, resetAt: 2000 },
+					secondary: { usedPercent: 0, resetAt: 3000 },
 					fetchedAt: 0,
 				},
 			],
