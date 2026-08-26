@@ -1,0 +1,180 @@
+name: LiteLLM Smoke
+
+on:
+  workflow_dispatch: {}
+  schedule:
+    - cron: '23 4 * * 1'
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/litellm-smoke.yml'
+      - 'package-lock.json'
+      - 'package.json'
+      - 'scripts/smoke*.ts'
+      - 'src/**'
+      - 'tests/**'
+
+permissions:
+  contents: read
+
+jobs:
+  smoke:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      LITELLM_BASE_URL: http://127.0.0.1:4000
+      LITELLM_API_KEY: sk-ci-litellm-smoke
+      LITELLM_MASTER_KEY: sk-ci-litellm-smoke
+      LITELLM_IMAGE: docker.litellm.ai/berriai/litellm:main-latest
+      LITELLM_SMOKE_MODELS: vidaimock-openai anthropic/vidaimock-claude
+      LITELLM_CLI_SMOKE_MODEL: vidaimock-openai
+      VIDAIMOCK_BASE_URL: http://127.0.0.1:8100
+      VIDAIMOCK_VERSION: v0.2.7
+
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+
+      - uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e # v6.4.0
+        with:
+          node-version: '24.16.0'
+          cache: 'npm'
+
+      - run: npm ci
+      - run: npm run build
+
+      - name: Install VidaiMock
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          mkdir -p .tmp/bin
+          asset="vidaimock-linux-x64.tar.gz"
+          curl -fsSL \
+            "https://github.com/vidaiUK/VidaiMock/releases/download/${VIDAIMOCK_VERSION}/${asset}" \
+            -o ".tmp/${asset}"
+          curl -fsSL \
+            "https://github.com/vidaiUK/VidaiMock/releases/download/${VIDAIMOCK_VERSION}/${asset%.tar.gz}.sha256" \
+            -o ".tmp/${asset%.tar.gz}.sha256"
+          (cd .tmp && sha256sum -c "${asset%.tar.gz}.sha256")
+          tar -xzf ".tmp/${asset}" -C .tmp
+          install -m 0755 .tmp/vidaimock/vidaimock .tmp/bin/vidaimock
+          .tmp/bin/vidaimock --version
+
+      - name: Start VidaiMock
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          .tmp/bin/vidaimock --host 0.0.0.0 --port 8100 > .tmp/vidaimock.log 2>&1 &
+          echo "$!" > .tmp/vidaimock.pid
+
+      - name: Wait for VidaiMock
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          for _ in {1..30}; do
+            if curl -fsS --connect-timeout 1 --max-time 3 "$VIDAIMOCK_BASE_URL/v1/models" >/tmp/vidaimock-models.json; then
+              cat /tmp/vidaimock-models.json
+              exit 0
+            fi
+            sleep 1
+          done
+          cat .tmp/vidaimock.log >&2 || true
+          exit 1
+
+      - name: Write LiteLLM smoke config
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          mkdir -p .tmp
+          cat > .tmp/litellm_config.yaml <<YAML
+          model_list:
+            - model_name: vidaimock-openai
+              litellm_params:
+                model: openai/gpt-4o-mini
+                api_base: http://host.docker.internal:8100/v1
+                api_key: sk-vidaimock
+            - model_name: anthropic/vidaimock-claude
+              litellm_params:
+                model: anthropic/claude-3-5-sonnet
+                api_base: http://host.docker.internal:8100
+                api_key: sk-vidaimock
+          general_settings:
+            master_key: ${LITELLM_MASTER_KEY}
+          YAML
+
+      - name: Start LiteLLM proxy
+        shell: bash
+        run: |
+          set -euo pipefail
+          docker run -d \
+            --name litellm-smoke \
+            --add-host=host.docker.internal:host-gateway \
+            -p 4000:4000 \
+            -v "$PWD/.tmp/litellm_config.yaml:/app/config.yaml:ro" \
+            -e LITELLM_MASTER_KEY \
+            "$LITELLM_IMAGE" \
+            --config /app/config.yaml
+
+      - name: Wait for LiteLLM proxy
+        shell: bash
+        run: |
+          set -euo pipefail
+          for _ in {1..60}; do
+            if curl -fsS --connect-timeout 1 --max-time 3 \
+              -H "Authorization: Bearer $LITELLM_API_KEY" \
+              "$LITELLM_BASE_URL/v1/models" >/tmp/litellm-models.json; then
+              cat /tmp/litellm-models.json
+              exit 0
+            fi
+            sleep 2
+          done
+          docker logs litellm-smoke >&2 || true
+          exit 1
+
+      - name: Run provider smoke
+        env:
+          LITELLM_SMOKE_TIMEOUT_MS: '60000'
+        run: npx tsx scripts/smoke.ts
+
+      - name: Run Pi CLI smoke
+        env:
+          LITELLM_DISCOVERY_TIMEOUT_MS: '60000'
+          PI_CODING_AGENT_DIR: ${{ runner.temp }}/pi-cli-smoke
+        run: |
+          set -euo pipefail
+
+          rm -rf "$PI_CODING_AGENT_DIR"
+          ./node_modules/.bin/pi -e ./dist/index.js --list-models litellm 2>&1 | tee /tmp/pi-litellm-models.txt
+          grep -F "vidaimock-openai" /tmp/pi-litellm-models.txt
+          grep -F "anthropic/vidaimock-claude" /tmp/pi-litellm-models.txt
+
+          ./node_modules/.bin/pi \
+            -e ./dist/index.js \
+            --provider litellm \
+            --model "$LITELLM_CLI_SMOKE_MODEL" \
+            --no-tools \
+            --no-session \
+            -p "Reply with one short word." | tee /tmp/pi-litellm-response.txt
+          grep -F "mock response" /tmp/pi-litellm-response.txt
+
+      - name: Dump LiteLLM logs
+        if: failure()
+        run: docker logs litellm-smoke || true
+
+      - name: Dump VidaiMock logs
+        if: failure()
+        run: cat .tmp/vidaimock.log || true
+
+      - name: Stop LiteLLM proxy
+        if: always()
+        run: docker rm -f litellm-smoke || true
+
+      - name: Stop VidaiMock
+        if: always()
+        run: |
+          if [[ -f .tmp/vidaimock.pid ]]; then
+            kill "$(cat .tmp/vidaimock.pid)" 2>/dev/null || true
+          fi

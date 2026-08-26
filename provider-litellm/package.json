@@ -1,0 +1,76 @@
+{
+  "name": "pi-provider-litellm",
+  "version": "1.2.5",
+  "description": "LiteLLM proxy provider extension for Pi",
+  "type": "module",
+  "license": "MIT",
+  "author": "Dávid Balatoni <balcsida@gmail.com>",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/doehyunbaek/pi-extensions.git",
+    "directory": "provider-litellm"
+  },
+  "homepage": "https://github.com/doehyunbaek/pi-extensions/tree/main/provider-litellm",
+  "bugs": "https://github.com/doehyunbaek/pi-extensions/issues",
+  "keywords": [
+    "pi-mono",
+    "pi-package",
+    "litellm",
+    "llm",
+    "extension",
+    "provider",
+    "proxy"
+  ],
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    }
+  },
+  "files": [
+    "dist",
+    "README.md",
+    "LICENSE"
+  ],
+  "pi": {
+    "extensions": [
+      "./src/index.ts"
+    ],
+    "image": "https://raw.githubusercontent.com/balcsida/pi-provider-litellm/refs/heads/main/assets/pi_litellm_gallery.png"
+  },
+  "scripts": {
+    "clean": "rm -rf dist",
+    "build": "tsgo -p tsconfig.build.json",
+    "dev": "tsgo -p tsconfig.build.json --watch --preserveWatchOutput",
+    "typecheck": "tsgo --noEmit",
+    "lint": "biome check --error-on-warnings .",
+    "format": "biome check --write .",
+    "test": "vitest --run",
+    "supply-chain:guard": "tsx scripts/supply-chain-guard.ts",
+    "check": "npm run lint && npm run typecheck && npm test",
+    "prepublishOnly": "npm run check && npm run clean && npm run build && npm run supply-chain:guard"
+  },
+  "engines": {
+    "node": ">=22.19.0"
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-ai": "*",
+    "@earendil-works/pi-coding-agent": "*"
+  },
+  "overrides": {
+    "basic-ftp": "6.0.1",
+    "fast-xml-builder": "1.2.0",
+    "protobufjs": "8.2.1"
+  },
+  "devDependencies": {
+    "@earendil-works/pi-ai": "^0.79.1",
+    "@earendil-works/pi-coding-agent": "^0.79.1",
+    "@biomejs/biome": "^2.4.15",
+    "@types/node": "^25.9.1",
+    "@typescript/native-preview": "7.0.0-dev.20260617.2",
+    "tsx": "^4.21.0",
+    "vitest": "^4.1.7"
+  }
+}
