@@ -1,3 +1,3 @@
 # Pi Provider LiteLLM
 
-Source repository: [doehyunbaek/pi-provider-litellm](https://github.com/doehyunbaek/pi-provider-litellm)
+Forked from [balcsida/pi-provider-litellm](https://github.com/balcsida/pi-provider-litellm).

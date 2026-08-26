@@ -1,3 +1,3 @@
 # MultiCodex
 
-Source repository: [doehyunbaek/pi-multicodex](https://github.com/doehyunbaek/pi-multicodex)
+Forked from [kim0/pi-multicodex](https://github.com/kim0/pi-multicodex).
