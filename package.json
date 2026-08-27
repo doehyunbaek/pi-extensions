@@ -3,7 +3,7 @@
   "private": true,
   "workspaces": [
     "multicodex",
-    "provider-litellm",
+    "litellm",
     "system-prompt"
   ],
   "scripts": {
@@ -26,7 +26,7 @@
   "pi": {
     "extensions": [
       "./multicodex/index.ts",
-      "./provider-litellm/src/index.ts",
+      "./litellm/index.ts",
       "./system-prompt/index.ts"
     ]
   }

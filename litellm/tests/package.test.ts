@@ -25,7 +25,7 @@ describe("pi package compatibility", () => {
       with: { type: "json" },
     });
 
-    expect(manifest.pi.extensions).toEqual(["./src/index.ts"]);
+    expect(manifest.pi.extensions).toEqual(["./index.ts"]);
   });
 
   it("accepts every pi package version through peer dependencies", async () => {

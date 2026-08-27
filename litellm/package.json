@@ -8,9 +8,9 @@
   "repository": {
     "type": "git",
     "url": "git+https://github.com/doehyunbaek/pi-extensions.git",
-    "directory": "provider-litellm"
+    "directory": "litellm"
   },
-  "homepage": "https://github.com/doehyunbaek/pi-extensions/tree/main/provider-litellm",
+  "homepage": "https://github.com/doehyunbaek/pi-extensions/tree/main/litellm",
   "bugs": "https://github.com/doehyunbaek/pi-extensions/issues",
   "keywords": [
     "pi-mono",
@@ -36,7 +36,7 @@
   ],
   "pi": {
     "extensions": [
-      "./src/index.ts"
+      "./index.ts"
     ],
     "image": "https://raw.githubusercontent.com/balcsida/pi-provider-litellm/refs/heads/main/assets/pi_litellm_gallery.png"
   },

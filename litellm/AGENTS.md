@@ -5,7 +5,7 @@
 - This package is a Pi extension that registers a `litellm` provider from `src/index.ts`.
 - Source is TypeScript ESM under `src/`; tests are Vitest specs under `tests/`.
 - Build output is `dist/`; do not edit generated output by hand.
-- The npm package entrypoint is `./dist/index.js`; Pi package installs load `./src/index.ts` via `package.json` `pi.extensions` so git installs work without committed build output.
+- The npm package entrypoint is `./dist/index.js`; Pi package installs load `./index.ts`, which re-exports `src/index.ts`, so git installs work without committed build output and Pi displays the extension as `litellm`.
 - Node support starts at `>=22.19.0`; GitHub workflows currently run Node `24.16.0`.
 
 ## Commands
