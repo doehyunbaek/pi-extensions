@@ -160,8 +160,4 @@ export default function (pi: ExtensionAPI) {
 		},
 	});
 
-	pi.registerShortcut("ctrl+m", {
-		description: "Show the latest persisted system prompt",
-		handler: async (ctx) => showLatestSnapshot(ctx, currentDynamicParts),
-	});
 }

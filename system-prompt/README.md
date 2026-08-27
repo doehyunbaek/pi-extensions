@@ -10,10 +10,9 @@ Load it for one invocation:
 pi -e ~/pi-extensions/system-prompt
 ```
 
-Commands and shortcut:
+Commands:
 
 ```text
-Ctrl+M                  Show the latest snapshot, or the current prompt if none exists
 /system-prompt          Show the latest snapshot, or the current prompt if none exists
 /system-prompt saved    Same as above
 /system-prompt latest   Same as above
