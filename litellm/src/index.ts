@@ -15,7 +15,6 @@ import {
 } from "./gcloud-token.js";
 import { getSessionIdFromFile } from "./litellm.js";
 import { createMcpToolDefinitions } from "./mcp-tools.js";
-import { createSkillsPromptSection, createSkillToolDefinitions, listSkills } from "./skills.js";
 import type { AuthFileEntry, CacheFile, DiscoveryOptions, DiscoveryResult, ResolvedCredentials } from "./types.js";
 
 const PROVIDER_NAME = "litellm";
@@ -544,13 +543,6 @@ export default async function (pi: ExtensionAPI): Promise<void> {
     return fresh.apiKey;
   }
 
-  function registerSkillTools(baseUrl: string | undefined): void {
-    if (!baseUrl) return;
-    for (const tool of createSkillToolDefinitions(baseUrl, resolveRuntimeApiKey)) {
-      pi.registerTool(tool);
-    }
-  }
-
   function seededRuntimeApiKey(seed: string): () => Promise<string> {
     let first: string | undefined = seed;
     return async () => {
@@ -577,7 +569,6 @@ export default async function (pi: ExtensionAPI): Promise<void> {
     }
   }
 
-  registerSkillTools(creds.baseUrl);
   await registerMcpTools(creds.baseUrl, liveDiscoveryApiKey);
 
   async function refreshModelsAndCosts(): Promise<RefreshResult> {
@@ -639,7 +630,6 @@ export default async function (pi: ExtensionAPI): Promise<void> {
     ctx.modelRegistry.refresh();
     const credentialBaseUrl = (credential as { baseUrl?: string }).baseUrl;
     const credentialAccess = typeof credential.access === "string" ? credential.access : undefined;
-    registerSkillTools(credentialBaseUrl);
     await registerMcpTools(credentialBaseUrl, credentialAccess);
     ctx.ui.notify(`Logged in to LiteLLM. Credentials saved to ${getAuthPath()}`, "info");
   }
@@ -688,16 +678,6 @@ export default async function (pi: ExtensionAPI): Promise<void> {
     if (ctx.model?.provider !== PROVIDER_NAME) return;
     if (typeof event.payload !== "object" || event.payload === null) return;
     return prepareLiteLLMRequestPayload(event.payload as Record<string, unknown>, ctx.model?.id, sessionId);
-  });
-
-  pi.on("before_agent_start", async (event) => {
-    if (discoveryDisabledReason()) return;
-    const fresh = await resolveCredentials();
-    if (!fresh.baseUrl || !fresh.apiKey) return;
-    const skills = await listSkills(fresh.baseUrl, fresh.apiKey);
-    const section = createSkillsPromptSection(skills);
-    if (!section) return;
-    return { systemPrompt: `${event.systemPrompt}\n\n${section}` };
   });
 
   pi.on("message_end", (event) => {

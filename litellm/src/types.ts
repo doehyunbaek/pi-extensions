@@ -76,12 +76,3 @@ export interface LiteLLMMcpTool {
   description: string;
   input_schema: Record<string, unknown>;
 }
-
-export interface LiteLLMSkill {
-  id?: string;
-  name: string;
-  description?: string;
-  enabled?: boolean;
-  input_schema?: Record<string, unknown>;
-  code?: string;
-}

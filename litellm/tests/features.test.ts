@@ -156,35 +156,6 @@ describe("feature parity", () => {
     expect(pi.tools.map((tool) => tool.name)).toContain("mcp_brave_search");
   });
 
-  it("injects enabled LiteLLM skills into the system prompt", async () => {
-    const agentDir = await mkdtemp(join(tmpdir(), "pi-provider-litellm-"));
-    process.env.LITELLM_BASE_URL = "https://litellm.example.com";
-    process.env.LITELLM_API_KEY = "sk-test";
-
-    vi.spyOn(globalThis, "fetch").mockImplementation(async (input) => {
-      const url = String(input);
-      if (url.endsWith("/model/info")) return jsonResponse(200, { data: [] });
-      if (url.endsWith("/mcp-rest/tools/list")) return jsonResponse(200, []);
-      if (url.endsWith("/v1/skills")) {
-        return jsonResponse(200, {
-          data: [{ id: "skill-1", name: "terraform", description: "Terraform conventions", enabled: true }],
-        });
-      }
-      throw new Error(`unexpected URL: ${url}`);
-    });
-
-    const extension = await loadExtension(agentDir);
-    const pi = createPi();
-    await extension(pi);
-
-    const beforeAgentStart = pi.handlers.get("before_agent_start")?.[0];
-    const result = await beforeAgentStart?.({ systemPrompt: "Base prompt" }, {});
-
-    expect(result.systemPrompt).toContain("Base prompt");
-    expect(result.systemPrompt).toContain("<litellm_skills>");
-    expect(result.systemPrompt).toContain("Terraform conventions");
-  });
-
   it("registers cost tracking and session grouping handlers", async () => {
     const agentDir = await mkdtemp(join(tmpdir(), "pi-provider-litellm-"));
     process.env.LITELLM_BASE_URL = "https://litellm.example.com";
