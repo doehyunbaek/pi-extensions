@@ -31,7 +31,9 @@ Or add it to `~/.pi/agent/settings.json`:
 
 Then run `/reload` in an existing Pi process.
 
-Autogist syncs after every settled agent run and when a session shuts down, including quit, reload, `/new`, `/resume`, and fork flows. It skips uploads when the session file has not changed.
+Autogist marks a session when it receives its first terminal-interactive input and automatically syncs only marked sessions. The marker is a small `custom` entry in the session JSONL and survives resume/restart. RPC and extension-generated inputs do not mark sessions, preventing benchmark and other automated runs from being uploaded automatically.
+
+For marked sessions, Autogist syncs after every settled agent run and when a session shuts down, including quit, reload, `/new`, `/resume`, and fork flows. It skips uploads when the session file has not changed. `/autogist sync` remains an explicit override that uploads the current session even without the marker.
 
 Commands:
 
@@ -53,6 +55,7 @@ Local session-to-gist mappings are stored under `~/.pi/agent/autogist/` with mod
 
 ## Limitations
 
+- Existing sessions are not retroactively classified; they are marked only after a new terminal-interactive input.
 - In-memory sessions have no JSONL file and are not backed up.
 - Backups require network access and a working authenticated `gh` command.
 - Gist limits apply; very large session files may fail to upload.

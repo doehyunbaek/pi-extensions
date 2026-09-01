@@ -79,6 +79,7 @@ const SESSIONS_DIR = join(AGENT_DIR, "sessions");
 const CONFIG_PATH = join(STATE_DIR, "config.json");
 const COOLDOWN_PATH = join(STATE_DIR, "cooldown.json");
 const DESCRIPTION_PREFIX = "Pi session backup";
+const INTERACTIVE_MARKER_TYPE = "autogist-interactive-session";
 const BATCH_CONCURRENCY = 1;
 const MIN_REQUEST_INTERVAL_MS = 2_000;
 const SECONDARY_LIMIT_COOLDOWN_MS = 60 * 60 * 1_000;
@@ -535,10 +536,22 @@ function errorMessage(error: unknown): string {
 	return error instanceof Error ? error.message : String(error);
 }
 
+export function hasInteractiveMarker(entries: readonly unknown[]): boolean {
+	return entries.some(
+		(entry) =>
+			typeof entry === "object" &&
+			entry !== null &&
+			(entry as { type?: unknown }).type === "custom" &&
+			(entry as { customType?: unknown }).customType ===
+				INTERACTIVE_MARKER_TYPE,
+	);
+}
+
 export default function (pi: ExtensionAPI) {
 	const sessionQueues = new Map<string, Promise<BackupRecord | undefined>>();
 	let lastError: string | undefined;
 	let lastRecord: BackupRecord | undefined;
+	let interactiveSession = false;
 
 	const syncFile = (
 		sessionFile: string,
@@ -633,6 +646,9 @@ export default function (pi: ExtensionAPI) {
 		ctx: ExtensionContext,
 		force = false,
 	): Promise<BackupRecord | undefined> => {
+		// Automatic backups are intentionally limited to sessions that received
+		// terminal input. RPC/extension-generated benchmark sessions remain local.
+		if (!force && !interactiveSession) return Promise.resolve(undefined);
 		// Capture plain values before entering the queue. The context becomes stale
 		// when Pi replaces a session, while an earlier upload may still be running.
 		const sessionFile = ctx.sessionManager.getSessionFile();
@@ -646,8 +662,18 @@ export default function (pi: ExtensionAPI) {
 	};
 
 	pi.on("session_start", async (_event, ctx) => {
+		interactiveSession = hasInteractiveMarker(ctx.sessionManager.getEntries());
 		const sessionFile = ctx.sessionManager.getSessionFile();
-		if (sessionFile) lastRecord = await loadRecord(sessionFile);
+		lastRecord = sessionFile ? await loadRecord(sessionFile) : undefined;
+	});
+
+	pi.on("input", (event) => {
+		if (event.source !== "interactive" || interactiveSession) return;
+		interactiveSession = true;
+		pi.appendEntry(INTERACTIVE_MARKER_TYPE, {
+			version: 1,
+			markedAt: new Date().toISOString(),
+		});
 	});
 
 	pi.on("agent_settled", async (_event, ctx) => {
@@ -982,11 +1008,14 @@ export default function (pi: ExtensionAPI) {
 			const record = sessionFile
 				? ((await loadRecord(sessionFile)) ?? lastRecord)
 				: undefined;
+			const automaticStatus = interactiveSession
+				? "Automatic backup: enabled (interactive session)"
+				: "Automatic backup: disabled (no interactive input marker)";
 			const status = !sessionFile
 				? "Autogist is inactive for this in-memory session"
 				: record
-					? `Autogist: ${record.gistUrl}\nLast backup: ${record.updatedAt}\nFile: ${record.filename}`
-					: "Autogist has not backed up this session yet";
+					? `Autogist: ${record.gistUrl}\nLast backup: ${record.updatedAt}\nFile: ${record.filename}\n${automaticStatus}`
+					: `Autogist has not backed up this session yet\n${automaticStatus}`;
 			ctx.ui.notify(
 				lastError ? `${status}\nLast error: ${lastError}` : status,
 				lastError ? "warning" : "info",

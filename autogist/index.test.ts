@@ -3,7 +3,12 @@ import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
-import { hashFile, listViewerSessions, readViewerSession } from "./index";
+import autogist, {
+	hashFile,
+	hasInteractiveMarker,
+	listViewerSessions,
+	readViewerSession,
+} from "./index";
 
 const tempDirs: string[] = [];
 
@@ -93,6 +98,54 @@ describe("lightweight session viewer metadata", () => {
 			"nested",
 			"root",
 		]);
+	});
+});
+
+describe("interactive session marker", () => {
+	it("recognizes only the Autogist custom marker", () => {
+		expect(
+			hasInteractiveMarker([
+				{ type: "message", message: { role: "user" } },
+				{ type: "custom", customType: "another-extension" },
+			]),
+		).toBe(false);
+		expect(
+			hasInteractiveMarker([
+				{ type: "custom", customType: "autogist-interactive-session" },
+			]),
+		).toBe(true);
+	});
+
+	it("persists one marker only for terminal input", async () => {
+		const handlers = new Map<string, (...args: never[]) => unknown>();
+		const appended: Array<{ customType: string; data: unknown }> = [];
+		autogist({
+			on: (event: string, handler: (...args: never[]) => unknown) =>
+				handlers.set(event, handler),
+			registerCommand: () => {},
+			appendEntry: (customType: string, data: unknown) =>
+				appended.push({ customType, data }),
+		} as never);
+		const sessionStart = handlers.get("session_start");
+		const input = handlers.get("input");
+		expect(sessionStart).toBeDefined();
+		expect(input).toBeDefined();
+		await sessionStart?.(
+			{} as never,
+			{
+				sessionManager: {
+					getEntries: () => [],
+					getSessionFile: () => undefined,
+				},
+			} as never,
+		);
+		input?.({ source: "rpc" } as never);
+		input?.({ source: "extension" } as never);
+		expect(appended).toHaveLength(0);
+		input?.({ source: "interactive" } as never);
+		input?.({ source: "interactive" } as never);
+		expect(appended).toHaveLength(1);
+		expect(appended[0]?.customType).toBe("autogist-interactive-session");
 	});
 });
 
