@@ -45,7 +45,7 @@ Commands:
 /autogist-device clear    Remove the device-name prefix
 ```
 
-In `/autogist-analyze`, use Up/Down to navigate, Space to select, `a` to select all visible sessions, Tab to switch between Current Folder and All, and Enter to sync the selection. Batch sync skips unchanged files and conservatively spaces GitHub writes two seconds apart. If GitHub reports a secondary content-creation limit, Autogist stops the batch immediately, persists a one-hour cooldown in `~/.pi/agent/autogist/cooldown.json`, and leaves the remaining sessions pending for a later run.
+In `/autogist-analyze`, use Up/Down to navigate, Space to select, `a` to select all visible sessions, Tab to switch between Current Folder and All, and Enter to sync the selection. The viewer streams session files into bounded metadata rows instead of loading transcript bodies, and hashes are streamed with limited concurrency. Batch sync skips unchanged files and conservatively spaces GitHub writes two seconds apart. If GitHub reports a secondary content-creation limit, Autogist stops the batch immediately, persists a one-hour cooldown in `~/.pi/agent/autogist/cooldown.json`, and leaves the remaining sessions pending for a later run.
 
 Gist filenames use `<device>__<timestamp>__<session-id>.jsonl`, for example `germany__2026-09-01T12-19-47-867Z__01a05ce9.jsonl`. The device name is stored in `~/.pi/agent/autogist/config.json`. After changing it, `/autogist sync` renames the current gist file; other session files are renamed on their next sync.
 

@@ -1,21 +1,20 @@
 import { spawn } from "node:child_process";
 import { createHash } from "node:crypto";
-import type { Dirent } from "node:fs";
+import { createReadStream, type Dirent } from "node:fs";
 import {
 	mkdir,
 	readdir,
 	readFile,
 	rename,
+	stat,
 	unlink,
 	writeFile,
 } from "node:fs/promises";
 import { homedir } from "node:os";
 import { basename, join } from "node:path";
-import {
-	type ExtensionAPI,
-	type ExtensionContext,
-	type SessionInfo,
-	SessionManager,
+import type {
+	ExtensionAPI,
+	ExtensionContext,
 } from "@earendil-works/pi-coding-agent";
 import { Key, matchesKey, truncateToWidth } from "@earendil-works/pi-tui";
 
@@ -60,6 +59,19 @@ class SecondaryRateLimitError extends Error {
 }
 
 type SyncStatus = "synchronized" | "pending";
+
+interface ViewerSession {
+	path: string;
+	id: string;
+	cwd: string;
+	modified: Date;
+	name?: string;
+	firstMessage?: string;
+}
+
+const METADATA_CONCURRENCY = 8;
+const FIRST_MESSAGE_LIMIT = 240;
+const MAX_METADATA_LINE_BYTES = 64 * 1024;
 
 const AGENT_DIR = join(homedir(), ".pi", "agent");
 const STATE_DIR = join(AGENT_DIR, "autogist");
@@ -213,32 +225,147 @@ async function loadAllRecords(): Promise<Map<string, BackupRecord>> {
 	return records;
 }
 
-async function listAllSessionInfos(): Promise<SessionInfo[]> {
-	// Pi's default listAll() scans project subdirectories, but older/custom
-	// sessions may live directly in the sessions root. Include both layouts.
-	const [organized, rootSessions] = await Promise.all([
-		SessionManager.listAll(),
-		SessionManager.listAll(SESSIONS_DIR),
-	]);
-	const byPath = new Map<string, SessionInfo>();
-	for (const session of [...organized, ...rootSessions]) {
-		byPath.set(session.path, session);
+function messagePreview(content: unknown): string | undefined {
+	let text: string | undefined;
+	if (typeof content === "string") text = content;
+	else if (Array.isArray(content)) {
+		text = content
+			.filter(
+				(part): part is { type: "text"; text: string } =>
+					typeof part === "object" &&
+					part !== null &&
+					(part as { type?: unknown }).type === "text" &&
+					typeof (part as { text?: unknown }).text === "string",
+			)
+			.map((part) => part.text)
+			.join(" ");
 	}
-	return [...byPath.values()].sort(
-		(a, b) => b.modified.getTime() - a.modified.getTime(),
+	if (!text) return undefined;
+	const compact = text.replace(/\s+/g, " ").trim();
+	return compact.length > FIRST_MESSAGE_LIMIT
+		? `${compact.slice(0, FIRST_MESSAGE_LIMIT - 1)}…`
+		: compact;
+}
+
+async function* readBoundedLines(path: string): AsyncGenerator<string> {
+	let buffered = "";
+	let oversized = false;
+	for await (const chunk of createReadStream(path, { encoding: "utf8" })) {
+		let start = 0;
+		let newline = chunk.indexOf("\n");
+		while (newline >= 0) {
+			const segment = chunk.slice(start, newline);
+			if (!oversized) {
+				const remaining = MAX_METADATA_LINE_BYTES - buffered.length;
+				if (segment.length <= remaining) buffered += segment;
+				else oversized = true;
+			}
+			if (!oversized)
+				yield buffered.endsWith("\r") ? buffered.slice(0, -1) : buffered;
+			buffered = "";
+			oversized = false;
+			start = newline + 1;
+			newline = chunk.indexOf("\n", start);
+		}
+		if (!oversized) {
+			const segment = chunk.slice(start);
+			const remaining = MAX_METADATA_LINE_BYTES - buffered.length;
+			if (segment.length <= remaining) buffered += segment;
+			else oversized = true;
+		}
+	}
+	if (!oversized && buffered) yield buffered;
+}
+
+/** Read only bounded fields needed by the viewer; never retain transcript bodies. */
+export async function readViewerSession(
+	path: string,
+): Promise<ViewerSession | undefined> {
+	let id: string | undefined;
+	let cwd: string | undefined;
+	let name: string | undefined;
+	let firstMessage: string | undefined;
+	for await (const line of readBoundedLines(path)) {
+		if (
+			id === undefined ||
+			line.includes('"type":"session_info"') ||
+			(firstMessage === undefined && line.includes('"role":"user"'))
+		) {
+			let entry: Record<string, unknown>;
+			try {
+				entry = JSON.parse(line) as Record<string, unknown>;
+			} catch {
+				continue;
+			}
+			if (entry.type === "session") {
+				if (typeof entry.id === "string") id = entry.id;
+				if (typeof entry.cwd === "string") cwd = entry.cwd;
+			} else if (entry.type === "session_info") {
+				name = typeof entry.name === "string" ? entry.name : undefined;
+			} else if (entry.type === "message") {
+				const message = entry.message as
+					| { role?: unknown; content?: unknown }
+					| undefined;
+				if (message?.role === "user")
+					firstMessage = messagePreview(message.content);
+			}
+		}
+	}
+	if (!id || !cwd) return undefined;
+	const fileStat = await stat(path);
+	return { path, id, cwd, modified: fileStat.mtime, name, firstMessage };
+}
+
+async function mapLimit<T, R>(
+	items: readonly T[],
+	limit: number,
+	mapper: (item: T) => Promise<R>,
+): Promise<R[]> {
+	const results = new Array<R>(items.length);
+	let next = 0;
+	const worker = async () => {
+		while (next < items.length) {
+			const index = next++;
+			results[index] = await mapper(items[index] as T);
+		}
+	};
+	await Promise.all(
+		Array.from({ length: Math.min(limit, items.length) }, () => worker()),
 	);
+	return results;
+}
+
+export async function listViewerSessions(
+	sessionsDir = SESSIONS_DIR,
+): Promise<ViewerSession[]> {
+	const files = await listFiles(sessionsDir, ".jsonl");
+	const sessions = await mapLimit(files, METADATA_CONCURRENCY, async (path) => {
+		try {
+			return await readViewerSession(path);
+		} catch {
+			return undefined;
+		}
+	});
+	return sessions
+		.filter((session): session is ViewerSession => session !== undefined)
+		.sort((a, b) => b.modified.getTime() - a.modified.getTime());
+}
+
+export async function hashFile(path: string): Promise<string> {
+	const hash = createHash("sha256");
+	for await (const chunk of createReadStream(path)) hash.update(chunk);
+	return hash.digest("hex");
 }
 
 async function getSyncStatus(
-	session: SessionInfo,
+	session: ViewerSession,
 	config: AutogistConfig,
 	records: Map<string, BackupRecord>,
 ): Promise<SyncStatus> {
 	const record = records.get(session.path);
 	if (!record) return "pending";
 	try {
-		const content = await readFile(session.path);
-		const sha256 = createHash("sha256").update(content).digest("hex");
+		const sha256 = await hashFile(session.path);
 		const expectedFilename = gistFilename(
 			session.path,
 			session.id,
@@ -270,8 +397,7 @@ async function analyzeBackups(): Promise<{
 			continue;
 		}
 		try {
-			const content = await readFile(sessionFile);
-			const sha256 = createHash("sha256").update(content).digest("hex");
+			const sha256 = await hashFile(sessionFile);
 			if (sha256 === record.sha256) synchronized++;
 			else pending++;
 		} catch {
@@ -596,22 +722,21 @@ export default function (pi: ExtensionAPI) {
 					return;
 				}
 
-				const [currentSessions, allSessions, records, config] =
-					await Promise.all([
-						SessionManager.list(ctx.cwd),
-						listAllSessionInfos(),
-						loadAllRecords(),
-						loadConfig(),
-					]);
-				const statuses = new Map<string, SyncStatus>();
-				await Promise.all(
-					allSessions.map(async (session) => {
-						statuses.set(
-							session.path,
-							await getSyncStatus(session, config, records),
-						);
-					}),
+				const [allSessions, records, config] = await Promise.all([
+					listViewerSessions(),
+					loadAllRecords(),
+					loadConfig(),
+				]);
+				const currentSessions = allSessions.filter(
+					(session) => session.cwd === ctx.cwd,
 				);
+				const statuses = new Map<string, SyncStatus>();
+				await mapLimit(allSessions, METADATA_CONCURRENCY, async (session) => {
+					statuses.set(
+						session.path,
+						await getSyncStatus(session, config, records),
+					);
+				});
 
 				const selectedPaths = await ctx.ui.custom<string[] | null>(
 					(tui, theme, _keybindings, done) => {
@@ -620,7 +745,7 @@ export default function (pi: ExtensionAPI) {
 						let scrollOffset = 0;
 						const maxVisible = 15;
 						const selected = new Set<string>();
-						const sorted = (sessions: SessionInfo[]) =>
+						const sorted = (sessions: ViewerSession[]) =>
 							[...sessions].sort(
 								(a, b) => b.modified.getTime() - a.modified.getTime(),
 							);
