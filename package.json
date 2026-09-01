@@ -4,7 +4,8 @@
   "workspaces": [
     "multicodex",
     "litellm",
-    "system-prompt"
+    "system-prompt",
+    "autogist"
   ],
   "scripts": {
     "check": "npm run check:multicodex && npm run check --workspace=pi-provider-litellm",
@@ -27,7 +28,8 @@
     "extensions": [
       "./multicodex/index.ts",
       "./litellm/index.ts",
-      "./system-prompt/index.ts"
+      "./system-prompt/index.ts",
+      "./autogist/index.ts"
     ]
   }
 }

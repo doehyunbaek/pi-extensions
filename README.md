@@ -5,6 +5,7 @@ Monorepo for the following [Pi](https://github.com/earendil-works/pi) extensions
 - [`pi-multicodex`](./multicodex) — rotate multiple ChatGPT Codex OAuth accounts
 - [`pi-provider-litellm`](./litellm) — use models and tools exposed by a LiteLLM proxy
 - [`pi-system-prompt`](./system-prompt) — inspect Pi's resolved system prompt
+- [`pi-autogist`](./autogist) — automatically back up session JSONL files to secret GitHub gists
 
 ## Install
 
