@@ -16,6 +16,7 @@ import {
 	buildHeatmapWeeks,
 	buildMulticodexProviderConfig,
 	createStreamWrapper,
+	formatCodexUsageSummary,
 	getHeatmapLevel,
 	getNextResetAt,
 	getOpenAICodexMirror,
@@ -24,6 +25,7 @@ import {
 	isUsageQuotaExhausted,
 	isUsageUntouched,
 	parseCodexUsageResponse,
+	parseResetCreditsResponse,
 	pickBestAccount,
 	readUsageLedgerAnalysis,
 	startOfLocalWeekMonday,
@@ -308,6 +310,7 @@ describe("AccountManager token refresh", () => {
 		restoreEnv("MULTICODEX_STORAGE_FILE", previousStorageFile);
 		restoreEnv("MULTICODEX_LOG_FILE", previousLogFile);
 		restoreEnv("MULTICODEX_LOCK_DIR", previousLockDir);
+		vi.unstubAllGlobals();
 		fs.rmSync(tempDir, { recursive: true, force: true });
 	});
 
@@ -407,6 +410,67 @@ describe("AccountManager token refresh", () => {
 		expect(refreshTokenMock).toHaveBeenCalledTimes(1);
 		expect(accountB?.refreshToken).toBe("new-refresh");
 	});
+
+	it("lists and consumes reset credits through the Codex backend", async () => {
+		const manager = new AccountManager();
+		manager.addOrUpdateAccount("a@example.com", {
+			access: "access",
+			refresh: "refresh",
+			expires: Date.now() + 60 * 60 * 1000,
+			accountId: "acct-a",
+		});
+		const account = manager.getAccount("a@example.com") as Account;
+		const fetchMock = vi.fn(
+			async (input: string | URL | Request, init?: RequestInit) => {
+				const url = String(input);
+				if (url.endsWith("/rate-limit-reset-credits/consume")) {
+					return Response.json({ code: "reset", windows_reset: 2 });
+				}
+				if (url.endsWith("/rate-limit-reset-credits")) {
+					return Response.json({
+						available_count: 1,
+						credits: [{ id: "credit-a", status: "available" }],
+					});
+				}
+				if (url.endsWith("/usage")) {
+					return Response.json({
+						rate_limit: {
+							primary_window: { used_percent: 0 },
+							secondary_window: { used_percent: 0 },
+						},
+					});
+				}
+				throw new Error(`Unexpected request: ${url} ${init?.method ?? "GET"}`);
+			},
+		);
+		vi.stubGlobal("fetch", fetchMock);
+
+		await expect(manager.getResetCredits(account)).resolves.toMatchObject([
+			{ id: "credit-a", status: "available" },
+		]);
+		await expect(
+			manager.redeemResetCredit(account, "credit-a", {
+				idempotencyKey: "request-a",
+			}),
+		).resolves.toEqual({ code: "reset", windows_reset: 2 });
+
+		const consumeCall = fetchMock.mock.calls.find(([input]) =>
+			String(input).endsWith("/consume"),
+		);
+		expect(consumeCall?.[1]?.method).toBe("POST");
+		expect(consumeCall?.[1]?.headers).toMatchObject({
+			Authorization: "Bearer access",
+			"ChatGPT-Account-Id": "acct-a",
+			"Content-Type": "application/json",
+		});
+		expect(JSON.parse(String(consumeCall?.[1]?.body))).toEqual({
+			redeem_request_id: "request-a",
+			credit_id: "credit-a",
+		});
+		expect(
+			fetchMock.mock.calls.some(([input]) => String(input).endsWith("/usage")),
+		).toBe(true);
+	});
 });
 
 describe("usage helpers", () => {
@@ -428,6 +492,18 @@ describe("usage helpers", () => {
 		expect(response.primary?.resetAt).toBe(1700000000 * 1000);
 		expect(response.secondary?.usedPercent).toBe(0);
 		expect(response.secondary?.resetAt).toBe(1700003600 * 1000);
+	});
+
+	it("parses reset availability from the usage response", () => {
+		const response = parseCodexUsageResponse({
+			rate_limit_reset_credits: {
+				available_count: 2,
+				applicable_available_count: 1,
+			},
+		});
+
+		expect(response.availableResetCount).toBe(2);
+		expect(response.applicableResetCount).toBe(1);
 	});
 
 	it("classifies windows by duration when weekly usage moves to primary", () => {
@@ -464,6 +540,48 @@ describe("usage helpers", () => {
 
 		expect(response.primary?.usedPercent).toBe(12);
 		expect(response.secondary?.usedPercent).toBe(34);
+	});
+
+	it("formats limits as remaining rather than used", () => {
+		const summary = formatCodexUsageSummary({
+			primary: { usedPercent: 1 },
+			secondary: { usedPercent: 0 },
+			fetchedAt: 0,
+		});
+
+		expect(summary).toContain("5h 99% left");
+		expect(summary).toContain("weekly 100% left");
+	});
+
+	it("parses, filters, and orders reset credits", () => {
+		const credits = parseResetCreditsResponse({
+			credits: [
+				{
+					id: "later",
+					status: "available",
+					is_supported_by_plan: true,
+					expires_at: "2026-10-04T22:53:53Z",
+					title: "Full reset",
+				},
+				{
+					id: "used",
+					status: "redeemed",
+				},
+				{
+					id: "earlier",
+					status: "available",
+					is_supported_by_plan: true,
+					expires_at: "2026-10-01T01:00:00Z",
+				},
+				{
+					id: "unsupported",
+					status: "available",
+					is_supported_by_plan: false,
+				},
+			],
+		});
+
+		expect(credits.map((credit) => credit.id)).toEqual(["earlier", "later"]);
 	});
 
 	it("detects untouched usage", () => {

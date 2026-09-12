@@ -381,9 +381,20 @@ interface CodexUsageWindow {
 	limitWindowSeconds?: number;
 }
 
+export interface RateLimitResetCredit {
+	id?: string;
+	status: string;
+	isSupportedByPlan?: boolean;
+	expiresAt?: number;
+	title?: string;
+	description?: string;
+}
+
 export interface CodexUsageSnapshot {
 	primary?: CodexUsageWindow;
 	secondary?: CodexUsageWindow;
+	availableResetCount?: number;
+	applicableResetCount?: number;
 	fetchedAt: number;
 }
 
@@ -392,6 +403,27 @@ interface WhamUsageResponse {
 		primary_window?: WhamUsageWindow;
 		secondary_window?: WhamUsageWindow;
 	};
+	rate_limit_reset_credits?: {
+		available_count?: number;
+		applicable_available_count?: number;
+	};
+}
+
+interface WhamResetCreditsResponse {
+	credits?: Array<{
+		id?: unknown;
+		status?: unknown;
+		is_supported_by_plan?: unknown;
+		expires_at?: unknown;
+		title?: unknown;
+		description?: unknown;
+	}>;
+	available_count?: number;
+}
+
+interface WhamConsumeResetResponse {
+	code?: string;
+	windows_reset?: number;
 }
 
 type WhamUsageWindow = {
@@ -516,7 +548,57 @@ export function parseCodexUsageResponse(
 		}
 	}
 
-	return { primary, secondary };
+	const availableResetCount = normalizeCount(
+		data.rate_limit_reset_credits?.available_count,
+	);
+	const applicableResetCount = normalizeCount(
+		data.rate_limit_reset_credits?.applicable_available_count,
+	);
+	return {
+		primary,
+		secondary,
+		...(availableResetCount !== undefined ? { availableResetCount } : {}),
+		...(applicableResetCount !== undefined ? { applicableResetCount } : {}),
+	};
+}
+
+function normalizeCount(value?: number): number | undefined {
+	if (typeof value !== "number" || !Number.isFinite(value)) return undefined;
+	return Math.max(0, Math.trunc(value));
+}
+
+export function parseResetCreditsResponse(
+	data: WhamResetCreditsResponse,
+): RateLimitResetCredit[] {
+	return (data.credits ?? [])
+		.flatMap((credit): RateLimitResetCredit[] => {
+			if (typeof credit.id !== "string" || typeof credit.status !== "string") {
+				return [];
+			}
+			const parsedExpiry =
+				typeof credit.expires_at === "string"
+					? Date.parse(credit.expires_at)
+					: Number.NaN;
+			return [
+				{
+					id: credit.id,
+					status: credit.status,
+					...(typeof credit.is_supported_by_plan === "boolean"
+						? { isSupportedByPlan: credit.is_supported_by_plan }
+						: {}),
+					...(Number.isFinite(parsedExpiry) ? { expiresAt: parsedExpiry } : {}),
+					...(typeof credit.title === "string" ? { title: credit.title } : {}),
+					...(typeof credit.description === "string"
+						? { description: credit.description }
+						: {}),
+				},
+			];
+		})
+		.filter(
+			(credit) =>
+				credit.status === "available" && credit.isSupportedByPlan !== false,
+		)
+		.sort((a, b) => (a.expiresAt ?? Infinity) - (b.expiresAt ?? Infinity));
 }
 
 export function isUsageUntouched(usage?: CodexUsageSnapshot): boolean {
@@ -545,14 +627,39 @@ export function getWeeklyResetAt(
 
 function formatResetAt(resetAt?: number): string {
 	if (!resetAt) return "unknown";
-	const diffMs = resetAt - Date.now();
-	if (diffMs <= 0) return "now";
-	const diffMinutes = Math.max(1, Math.round(diffMs / 60000));
-	if (diffMinutes < 60) return `in ${diffMinutes}m`;
-	const diffHours = Math.round(diffMinutes / 60);
-	if (diffHours < 48) return `in ${diffHours}h`;
-	const diffDays = Math.round(diffHours / 24);
-	return `in ${diffDays}d`;
+	if (resetAt <= Date.now()) return "now";
+	return new Intl.DateTimeFormat(undefined, {
+		month: "short",
+		day: "numeric",
+		hour: "numeric",
+		minute: "2-digit",
+	}).format(new Date(resetAt));
+}
+
+function formatUsageWindow(label: string, window?: CodexUsageWindow): string {
+	const remaining =
+		window?.usedPercent === undefined
+			? "unknown"
+			: `${Math.round(100 - window.usedPercent)}% left`;
+	return `${label} ${remaining} (resets ${formatResetAt(window?.resetAt)})`;
+}
+
+export function formatCodexUsageSummary(usage?: CodexUsageSnapshot): string {
+	return `${formatUsageWindow("5h", usage?.primary)} | ${formatUsageWindow(
+		"weekly",
+		usage?.secondary,
+	)}`;
+}
+
+function codexHeaders(
+	accessToken: string,
+	accountId: string | undefined,
+): Record<string, string> {
+	return {
+		Authorization: `Bearer ${accessToken}`,
+		Accept: "application/json",
+		...(accountId ? { "ChatGPT-Account-Id": accountId } : {}),
+	};
 }
 
 async function fetchCodexUsage(
@@ -565,16 +672,8 @@ async function fetchCodexUsage(
 		USAGE_REQUEST_TIMEOUT_MS,
 	);
 	try {
-		const headers: Record<string, string> = {
-			Authorization: `Bearer ${accessToken}`,
-			Accept: "application/json",
-		};
-		if (accountId) {
-			headers["ChatGPT-Account-Id"] = accountId;
-		}
-
 		const response = await fetch("https://chatgpt.com/backend-api/wham/usage", {
-			headers,
+			headers: codexHeaders(accessToken, accountId),
 			signal: controller.signal,
 		});
 
@@ -584,6 +683,69 @@ async function fetchCodexUsage(
 
 		const data = (await response.json()) as WhamUsageResponse;
 		return { ...parseCodexUsageResponse(data), fetchedAt: Date.now() };
+	} finally {
+		clear();
+	}
+}
+
+async function fetchResetCredits(
+	accessToken: string,
+	accountId: string | undefined,
+	options?: { signal?: AbortSignal },
+): Promise<RateLimitResetCredit[]> {
+	const { controller, clear } = createTimeoutController(
+		options?.signal,
+		USAGE_REQUEST_TIMEOUT_MS,
+	);
+	try {
+		const response = await fetch(
+			"https://chatgpt.com/backend-api/wham/rate-limit-reset-credits",
+			{
+				headers: codexHeaders(accessToken, accountId),
+				signal: controller.signal,
+			},
+		);
+		if (!response.ok) {
+			throw new Error(`Reset credit request failed: ${response.status}`);
+		}
+		return parseResetCreditsResponse(
+			(await response.json()) as WhamResetCreditsResponse,
+		);
+	} finally {
+		clear();
+	}
+}
+
+async function consumeResetCredit(
+	accessToken: string,
+	accountId: string | undefined,
+	creditId: string | undefined,
+	options?: { signal?: AbortSignal; idempotencyKey?: string },
+): Promise<WhamConsumeResetResponse> {
+	const { controller, clear } = createTimeoutController(
+		options?.signal,
+		USAGE_REQUEST_TIMEOUT_MS,
+	);
+	try {
+		const response = await fetch(
+			"https://chatgpt.com/backend-api/wham/rate-limit-reset-credits/consume",
+			{
+				method: "POST",
+				headers: {
+					...codexHeaders(accessToken, accountId),
+					"Content-Type": "application/json",
+				},
+				body: JSON.stringify({
+					redeem_request_id: options?.idempotencyKey ?? crypto.randomUUID(),
+					...(creditId ? { credit_id: creditId } : {}),
+				}),
+				signal: controller.signal,
+			},
+		);
+		if (!response.ok) {
+			throw new Error(`Usage reset failed: ${response.status}`);
+		}
+		return (await response.json()) as WhamConsumeResetResponse;
 	} finally {
 		clear();
 	}
@@ -1003,6 +1165,54 @@ export class AccountManager {
 			);
 			return undefined;
 		}
+	}
+
+	async getResetCredits(
+		account: Account,
+		options?: { signal?: AbortSignal },
+	): Promise<RateLimitResetCredit[]> {
+		const token = await this.ensureValidToken(account);
+		try {
+			const credits = await fetchResetCredits(
+				token,
+				account.accountId,
+				options,
+			);
+			if (credits.length > 0) return credits;
+		} catch (error) {
+			if (!(this.usageCache.get(account.email)?.availableResetCount ?? 0)) {
+				throw error;
+			}
+			logMulticodex("reset_credits.details.failure", {
+				email: account.email,
+				error,
+			});
+		}
+
+		// Match Codex CLI's fallback: /wham/usage carries a summary count, so a
+		// generic consume request remains possible when details are unavailable.
+		return (this.usageCache.get(account.email)?.availableResetCount ?? 0) > 0
+			? [{ status: "available", title: "Full reset" }]
+			: [];
+	}
+
+	async redeemResetCredit(
+		account: Account,
+		creditId?: string,
+		options?: { signal?: AbortSignal; idempotencyKey?: string },
+	): Promise<WhamConsumeResetResponse> {
+		const token = await this.ensureValidToken(account);
+		const result = await consumeResetCredit(
+			token,
+			account.accountId,
+			creditId,
+			options,
+		);
+		await this.refreshUsageForAccount(account, {
+			force: true,
+			signal: options?.signal,
+		});
+		return result;
 	}
 
 	async refreshUsageForAllAccounts(options?: {
@@ -1504,9 +1714,9 @@ export default function multicodexExtension(pi: ExtensionAPI) {
 		},
 	});
 
-	// View account status and select the active account.
-	pi.registerCommand("multicodex-use", {
-		description: "View Codex account usage and select an account",
+	pi.registerCommand("multicodex-usage", {
+		description:
+			"View limits, select an account, or redeem a usage limit reset",
 		handler: async (
 			_args: string,
 			ctx: ExtensionCommandContext,
@@ -1520,46 +1730,116 @@ export default function multicodexExtension(pi: ExtensionAPI) {
 				return;
 			}
 
-			await accountManager.refreshUsageForAllAccounts();
-			const active = accountManager.getActiveAccount();
+			// Codex CLI treats command-driven usage reads as authoritative. Force a
+			// fetch so a quota reset is visible immediately instead of after the TTL.
+			await accountManager.refreshUsageForAllAccounts({ force: true });
 			const options = accounts.map((account) => {
 				const usage = accountManager.getCachedUsage(account.email);
-				const isActive = active?.email === account.email;
-				const quotaHit = isUsageQuotaExhausted(usage, Date.now());
-				const untouched = isUsageUntouched(usage) ? "untouched" : null;
+				const resets = usage?.availableResetCount;
+				const resetLabel =
+					resets === undefined
+						? "resets unknown"
+						: `${resets} resets available`;
 				const tags = [
-					isActive ? "active" : null,
-					quotaHit ? "quota" : null,
-					untouched,
+					accountManager.getActiveAccount()?.email === account.email
+						? "active"
+						: null,
+					isUsageQuotaExhausted(usage) ? "quota" : null,
+					isUsageUntouched(usage) ? "untouched" : null,
 				]
 					.filter(Boolean)
 					.join(", ");
-				const suffix = tags ? ` (${tags})` : "";
-				const primaryUsed = usage?.primary?.usedPercent;
-				const secondaryUsed = usage?.secondary?.usedPercent;
-				const primaryReset = usage?.primary?.resetAt;
-				const secondaryReset = usage?.secondary?.resetAt;
-				const primaryLabel =
-					primaryUsed === undefined ? "unknown" : `${Math.round(primaryUsed)}%`;
-				const secondaryLabel =
-					secondaryUsed === undefined
-						? "unknown"
-						: `${Math.round(secondaryUsed)}%`;
-				const usageSummary = `5h ${primaryLabel} reset:${formatResetAt(primaryReset)} | weekly ${secondaryLabel} reset:${formatResetAt(secondaryReset)}`;
-				return `${isActive ? "•" : " "} ${account.email}${suffix} - ${usageSummary}`;
+				return `${account.email}${tags ? ` (${tags})` : ""} — ${formatCodexUsageSummary(usage)} — ${resetLabel}`;
 			});
-
-			const selected = await ctx.ui.select(
-				"Select MultiCodex Account",
-				options,
-			);
+			const selected = await ctx.ui.select("MultiCodex usage", options);
 			if (!selected) return;
-			const selectedIndex = options.indexOf(selected);
-			const selectedAccount = accounts[selectedIndex];
-			if (!selectedAccount) return;
+			const account = accounts[options.indexOf(selected)];
+			if (!account) return;
 
-			accountManager.setManualAccount(selectedAccount.email);
-			ctx.ui.notify(`Switched to ${selectedAccount.email}`, "info");
+			const action = await ctx.ui.select(account.email, [
+				"Use this account",
+				"Redeem usage limit reset",
+			]);
+			if (!action) return;
+			if (action === "Use this account") {
+				accountManager.setManualAccount(account.email);
+				ctx.ui.notify(`Switched to ${account.email}`, "info");
+				return;
+			}
+
+			let credits: RateLimitResetCredit[];
+			try {
+				credits = await accountManager.getResetCredits(account);
+			} catch (error) {
+				ctx.ui.notify(
+					`Couldn't load usage limit resets: ${getErrorMessage(error)}`,
+					"error",
+				);
+				return;
+			}
+			if (credits.length === 0) {
+				ctx.ui.notify("No usage limit resets available.", "info");
+				return;
+			}
+
+			const creditOptions = credits.map((credit) => {
+				const title = credit.title?.trim() || "Full reset";
+				const expiry = credit.expiresAt
+					? `expires ${formatResetAt(credit.expiresAt)}`
+					: "does not expire";
+				return `${title} — ${expiry}`;
+			});
+			const selectedCredit = await ctx.ui.select(
+				`Usage limit resets for ${account.email}`,
+				creditOptions,
+			);
+			if (!selectedCredit) return;
+			const credit = credits[creditOptions.indexOf(selectedCredit)];
+			if (!credit) return;
+			const confirmed = await ctx.ui.confirm(
+				"Use this reset?",
+				`${credit.title?.trim() || "Full reset"} for ${account.email}\n${
+					credit.description?.trim() || "Reset your current usage limits."
+				}`,
+			);
+			if (!confirmed) return;
+
+			try {
+				const result = await accountManager.redeemResetCredit(
+					account,
+					credit.id,
+					{ idempotencyKey: crypto.randomUUID() },
+				);
+				switch (result.code) {
+					case "reset":
+						ctx.ui.notify(
+							`Usage reset for ${account.email}${
+								result.windows_reset ? ` (${result.windows_reset} windows)` : ""
+							}.`,
+							"info",
+						);
+						break;
+					case "already_redeemed":
+						ctx.ui.notify("That reset was already redeemed.", "info");
+						break;
+					case "nothing_to_reset":
+						ctx.ui.notify(
+							"Your usage does not need a reset right now.",
+							"info",
+						);
+						break;
+					case "no_credit":
+						ctx.ui.notify("That reset is no longer available.", "warning");
+						break;
+					default:
+						ctx.ui.notify("Usage reset request completed.", "info");
+				}
+			} catch (error) {
+				ctx.ui.notify(
+					`Couldn't reset usage: ${getErrorMessage(error)}`,
+					"error",
+				);
+			}
 		},
 	});
 
