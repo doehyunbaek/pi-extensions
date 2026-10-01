@@ -31,6 +31,8 @@
 	"author": "kim0",
 	"files": [
 		"index.ts",
+		"gist-sync.ts",
+		"os-lock.ts",
 		"openai-codex-oauth.ts",
 		"README.md",
 		"LICENSE",
@@ -55,5 +57,8 @@
 		"@typescript/native-preview": "7.0.0-dev.20260203.1",
 		"typescript": "^5.9.3",
 		"vitest": "^4.0.18"
+	},
+	"dependencies": {
+		"koffi": "^2.16.3"
 	}
 }

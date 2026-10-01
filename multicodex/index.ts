@@ -33,6 +33,18 @@ import type {
 } from "@mariozechner/pi-coding-agent";
 import { Key, matchesKey, truncateToWidth } from "@mariozechner/pi-tui";
 import {
+	atomicWrite,
+	createSecretGist,
+	credentialsPending,
+	type GistSyncConfig,
+	LockBusyError,
+	lockFile,
+	mergeAccounts,
+	type SyncState,
+	sharedAccounts,
+	syncGist,
+} from "./gist-sync";
+import {
 	loginOpenAICodex,
 	refreshOpenAICodexToken,
 } from "./openai-codex-oauth";
@@ -45,7 +57,6 @@ const USAGE_CACHE_TTL_MS = 5 * 60 * 1000;
 const USAGE_REQUEST_TIMEOUT_MS = 10 * 1000;
 const ACCESS_TOKEN_REFRESH_SKEW_MS = 5 * 60 * 1000;
 const TOKEN_REFRESH_LOCK_WAIT_MS = 60 * 1000;
-const TOKEN_REFRESH_LOCK_STALE_MS = 5 * 60 * 1000;
 const TOKEN_REFRESH_LOCK_POLL_MS = 250;
 const TOKEN_REFRESH_LOCK_DIR = path.join(
 	os.homedir(),
@@ -214,44 +225,15 @@ function getTokenRefreshLockDir(): string {
 	return process.env.MULTICODEX_LOCK_DIR || TOKEN_REFRESH_LOCK_DIR;
 }
 
-function getTokenRefreshLockPath(): string {
-	return path.join(getTokenRefreshLockDir(), "token-refresh.lock");
-}
-
-function getErrnoCode(error: unknown): string | undefined {
-	return typeof error === "object" && error !== null && "code" in error
-		? String((error as { code?: unknown }).code)
-		: undefined;
-}
-
 async function acquireTokenRefreshLock(email: string): Promise<() => void> {
-	const lockPath = getTokenRefreshLockPath();
-	const ownerFile = path.join(lockPath, "owner.json");
+	const lockPath = path.join(getTokenRefreshLockDir(), "token-refresh");
 	const lockId = getAccountLockId(email);
-	const ownerId = `${process.pid}:${Date.now()}:${crypto.randomUUID()}`;
 	const startedAt = Date.now();
 	let loggedWait = false;
 
 	while (true) {
 		try {
-			const lockDir = getTokenRefreshLockDir();
-			if (!fs.existsSync(lockDir)) {
-				fs.mkdirSync(lockDir, { recursive: true });
-			}
-			fs.mkdirSync(lockPath);
-			try {
-				fs.writeFileSync(
-					ownerFile,
-					JSON.stringify(
-						{ ownerId, pid: process.pid, lockId, email, createdAt: Date.now() },
-						null,
-						2,
-					),
-				);
-			} catch (error) {
-				fs.rmSync(lockPath, { recursive: true, force: true });
-				throw error;
-			}
+			const release = lockFile(lockPath);
 			logMulticodex("token.refresh.lock.acquired", {
 				email,
 				lockId,
@@ -262,37 +244,11 @@ async function acquireTokenRefreshLock(email: string): Promise<() => void> {
 			return () => {
 				if (released) return;
 				released = true;
-				try {
-					const stored = JSON.parse(fs.readFileSync(ownerFile, "utf-8")) as {
-						ownerId?: string;
-					};
-					if (stored.ownerId !== ownerId) {
-						logMulticodex("token.refresh.lock.release.skipped", {
-							email,
-							lockId,
-							reason: "owner_mismatch",
-						});
-						return;
-					}
-					fs.rmSync(lockPath, { recursive: true, force: true });
-					logMulticodex("token.refresh.lock.released", { email, lockId });
-				} catch (error) {
-					if (!fs.existsSync(lockPath)) {
-						logMulticodex("token.refresh.lock.release.missing", {
-							email,
-							lockId,
-						});
-						return;
-					}
-					logMulticodex("token.refresh.lock.release.failure", {
-						email,
-						lockId,
-						error,
-					});
-				}
+				release();
+				logMulticodex("token.refresh.lock.released", { email, lockId });
 			};
 		} catch (error) {
-			if (getErrnoCode(error) !== "EEXIST") {
+			if (!(error instanceof LockBusyError)) {
 				logMulticodex("token.refresh.lock.acquire.failure", {
 					email,
 					lockId,
@@ -301,22 +257,7 @@ async function acquireTokenRefreshLock(email: string): Promise<() => void> {
 				throw error;
 			}
 
-			let lockAgeMs = 0;
-			try {
-				lockAgeMs = Date.now() - fs.statSync(lockPath).mtimeMs;
-			} catch {
-				continue;
-			}
-
-			if (lockAgeMs > TOKEN_REFRESH_LOCK_STALE_MS) {
-				logMulticodex("token.refresh.lock.stale_removed", {
-					email,
-					lockId,
-					lockAgeMs,
-				});
-				fs.rmSync(lockPath, { recursive: true, force: true });
-				continue;
-			}
+			// The OS releases ownership on exit; a live/paused owner is never evicted.
 
 			const waitedMs = Date.now() - startedAt;
 			if (waitedMs > TOKEN_REFRESH_LOCK_WAIT_MS) {
@@ -836,6 +777,15 @@ export interface Account {
 interface StorageData {
 	accounts: Account[];
 	activeEmail?: string;
+	gistSync?: GistSyncConfig;
+	gistSyncState?: SyncState;
+	gistSyncStatus?: {
+		lastSuccess?: number;
+		error?: string;
+		conflict?: boolean;
+		failures?: number;
+		nextRetry?: number;
+	};
 }
 
 function normalizeStorageData(value: unknown): StorageData {
@@ -849,6 +799,9 @@ function normalizeStorageData(value: unknown): StorageData {
 		: [];
 	return {
 		accounts,
+		...(raw.gistSync ? { gistSync: raw.gistSync } : {}),
+		...(raw.gistSyncState ? { gistSyncState: raw.gistSyncState } : {}),
+		...(raw.gistSyncStatus ? { gistSyncStatus: raw.gistSyncStatus } : {}),
 		...(typeof raw.activeEmail === "string"
 			? { activeEmail: raw.activeEmail }
 			: {}),
@@ -957,9 +910,16 @@ export class AccountManager {
 	private tokenRefreshes = new Map<string, Promise<string>>();
 	private warningHandler?: WarningHandler;
 	private manualEmail?: string;
+	private baseline: StorageData;
+	private gistSyncInFlight?: Promise<void>;
+	private syncTimer?: ReturnType<typeof setTimeout>;
+	private syncEnabled = false;
+	private syncWorkerBusy = false;
+	private statusHandler?: (status: string) => void;
 
 	constructor() {
 		this.data = this.load();
+		this.baseline = structuredClone(this.data);
 	}
 
 	private load(): StorageData {
@@ -986,12 +946,32 @@ export class AccountManager {
 	private save(): void {
 		try {
 			const storageFile = getMulticodexStorageFile();
-			const dir = path.dirname(storageFile);
-			if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
-			fs.writeFileSync(
-				storageFile,
-				JSON.stringify(normalizeStorageData(this.data), null, 2),
-			);
+			const release = lockFile(storageFile);
+			try {
+				const disk = fs.existsSync(storageFile)
+					? normalizeStorageData(
+							JSON.parse(fs.readFileSync(storageFile, "utf8")),
+						)
+					: { accounts: [] };
+				const merged = {
+					...disk,
+					accounts: mergeAccounts(
+						this.baseline.accounts,
+						this.data.accounts,
+						disk.accounts,
+					),
+					activeEmail:
+						this.data.activeEmail !== this.baseline.activeEmail
+							? this.data.activeEmail
+							: disk.activeEmail,
+				};
+				atomicWrite(storageFile, merged);
+				this.data = merged;
+				this.baseline = structuredClone(merged);
+			} finally {
+				release();
+			}
+			this.scheduleSync();
 			logMulticodex("storage.save.success", {
 				accounts: this.data.accounts.map((account) => ({
 					email: account.email,
@@ -1002,6 +982,266 @@ export class AccountManager {
 		} catch (e) {
 			console.error("Failed to save multicodex accounts:", e);
 			logMulticodex("storage.save.failure", { error: e });
+			// Discard unsaved mutations so a later selection cannot publish them.
+			this.tryReloadFromDisk();
+			throw e;
+		}
+	}
+
+	getSyncStatus(details = false): string {
+		const disk = this.load();
+		if (!disk.gistSync?.gistId) return "disabled";
+		const status = disk.gistSyncStatus;
+		const pending =
+			disk.gistSyncState?.gistId !== disk.gistSync.gistId ||
+			credentialsPending(disk.accounts, disk.gistSyncState?.accounts ?? []);
+		if (status?.conflict) return "conflict — run /multicodex-sync";
+		if (this.gistSyncInFlight) return "syncing";
+		if (status?.nextRetry) {
+			return details
+				? `retrying at ${new Date(status.nextRetry).toISOString()}: ${status.error ?? "sync failed"}${status.lastSuccess ? `; last success: ${new Date(status.lastSuccess).toISOString()}` : ""}`
+				: `retrying in ${Math.max(0, Math.ceil((status.nextRetry - Date.now()) / 1000))}s`;
+		}
+		const label = pending ? "pending" : "synced";
+		return details && status?.lastSuccess
+			? `${label}; last success: ${new Date(status.lastSuccess).toISOString()}`
+			: label;
+	}
+
+	startSync(handler?: (status: string) => void): void {
+		this.syncEnabled = true;
+		this.statusHandler = handler;
+		this.scheduleSync();
+	}
+
+	stopSync(): void {
+		this.syncEnabled = false;
+		clearTimeout(this.syncTimer);
+		this.syncTimer = undefined;
+		this.statusHandler = undefined;
+	}
+
+	private scheduleSync(): void {
+		if (!this.syncEnabled) return;
+		clearTimeout(this.syncTimer);
+		this.publishSyncStatus();
+		const disk = this.load();
+		if (!disk.gistSync?.gistId) return;
+		// Poll local durable state too: another Pi process may save or acknowledge it.
+		const pending =
+			disk.gistSyncState?.gistId !== disk.gistSync.gistId ||
+			credentialsPending(disk.accounts, disk.gistSyncState?.accounts ?? []);
+		const delay =
+			(pending || disk.gistSyncStatus?.nextRetry) &&
+			!disk.gistSyncStatus?.conflict
+				? Math.max(250, (disk.gistSyncStatus?.nextRetry ?? 0) - Date.now())
+				: 30_000;
+		this.syncTimer = setTimeout(() => {
+			const current = this.load();
+			if (
+				this.syncEnabled &&
+				!this.syncWorkerBusy &&
+				current.gistSync?.gistId &&
+				!current.gistSyncStatus?.conflict &&
+				(current.gistSyncStatus?.nextRetry ?? 0) <= Date.now() &&
+				(current.gistSyncStatus?.nextRetry ||
+					current.gistSyncState?.gistId !== current.gistSync.gistId ||
+					credentialsPending(
+						current.accounts,
+						current.gistSyncState?.accounts ?? [],
+					))
+			) {
+				this.syncWorkerBusy = true;
+				void this.syncAccounts(true)
+					.catch(() => {})
+					.finally(() => {
+						this.syncWorkerBusy = false;
+						this.scheduleSync();
+					});
+			} else this.scheduleSync();
+		}, delay);
+		this.syncTimer.unref();
+	}
+
+	private publishSyncStatus(): void {
+		try {
+			this.statusHandler?.(this.getSyncStatus());
+		} catch {
+			/* UI must not affect credential saves. */
+		}
+	}
+
+	private recordSyncFailure(error: unknown): void {
+		try {
+			const file = getMulticodexStorageFile();
+			const release = lockFile(file);
+			try {
+				const disk = normalizeStorageData(
+					JSON.parse(fs.readFileSync(file, "utf8")),
+				);
+				if (!disk.gistSync?.gistId) return;
+				const conflict =
+					error instanceof Error &&
+					error.message.startsWith("Conflicting credentials");
+				const failures = (disk.gistSyncStatus?.failures ?? 0) + 1;
+				disk.gistSyncStatus = {
+					lastSuccess: disk.gistSyncStatus?.lastSuccess,
+					failures,
+					conflict,
+					error: conflict
+						? "Credential conflict; manual reconciliation required"
+						: "Gist sync failed (network, authentication, or storage busy)",
+					nextRetry: conflict
+						? undefined
+						: Date.now() +
+							Math.min(300_000, 1000 * 2 ** Math.min(failures, 8)) *
+								(0.8 + Math.random() * 0.4),
+				};
+				atomicWrite(file, disk);
+			} finally {
+				release();
+			}
+		} catch {
+			/* Pending credentials themselves remain durable if status storage is busy. */
+		}
+	}
+
+	/** Network failure must not prevent ordinary local use. */
+	syncAccounts(automatic = false): Promise<void> {
+		if (this.gistSyncInFlight) return this.gistSyncInFlight;
+		this.gistSyncInFlight = this.performGistSync(automatic)
+			.catch((error: unknown) => {
+				this.recordSyncFailure(error);
+				throw error;
+			})
+			.finally(() => {
+				this.gistSyncInFlight = undefined;
+				this.scheduleSync();
+			});
+		this.publishSyncStatus();
+		return this.gistSyncInFlight;
+	}
+
+	/** Read-only remote fetch before OAuth rotation; never push expired credentials. */
+	async pullAccounts(): Promise<void> {
+		await this.gistSyncInFlight;
+		const storageFile = getMulticodexStorageFile();
+		const releaseSync = lockFile(`${storageFile}.gist-sync`);
+		try {
+			const readDisk = (): StorageData =>
+				normalizeStorageData(JSON.parse(fs.readFileSync(storageFile, "utf8")));
+			const snapshot = readDisk();
+			const config = snapshot.gistSync;
+			if (!config?.gistId) return;
+			const base =
+				snapshot.gistSyncState?.gistId === config.gistId
+					? snapshot.gistSyncState.accounts
+					: [];
+			const remote = await syncGist(config, base, snapshot.accounts, {
+				pullOnly: true,
+			});
+			const release = lockFile(storageFile);
+			try {
+				const disk = readDisk();
+				if (disk.gistSync?.gistId !== config.gistId)
+					throw new Error("Gist configuration changed during pull");
+				const localUsage = new Map(
+					disk.accounts.map((a) => [a.email, a.lastUsed]),
+				);
+				disk.accounts = mergeAccounts(base, disk.accounts, remote).map((a) => ({
+					...a,
+					lastUsed: localUsage.get(a.email),
+				}));
+				disk.gistSyncState = {
+					gistId: config.gistId,
+					accounts: sharedAccounts(remote),
+				};
+				atomicWrite(storageFile, disk);
+				this.data = disk;
+				this.baseline = structuredClone(disk);
+			} finally {
+				release();
+			}
+		} finally {
+			releaseSync();
+		}
+	}
+
+	private async performGistSync(automatic = false): Promise<void> {
+		const storageFile = getMulticodexStorageFile();
+		const releaseSync = lockFile(`${storageFile}.gist-sync`);
+		try {
+			const readDisk = (): StorageData =>
+				fs.existsSync(storageFile)
+					? normalizeStorageData(
+							JSON.parse(fs.readFileSync(storageFile, "utf8")),
+						)
+					: { accounts: [] };
+			let snapshot = readDisk();
+			if (automatic && !snapshot.gistSync?.gistId) return;
+			const gistId = automatic
+				? snapshot.gistSync?.gistId
+				: await createSecretGist();
+			if (!gistId) return;
+			if (snapshot.gistSync?.gistId !== gistId) {
+				const previousConfig = JSON.stringify(snapshot.gistSync);
+				try {
+					const release = lockFile(storageFile);
+					try {
+						const disk = readDisk();
+						if (JSON.stringify(disk.gistSync) !== previousConfig) {
+							throw new Error("Gist configuration changed during creation");
+						}
+						disk.gistSync = { gistId };
+						atomicWrite(storageFile, disk);
+						snapshot = disk;
+					} finally {
+						release();
+					}
+				} catch {
+					throw new Error(
+						`Resolved shared secret Gist ${gistId}, but could not save its ID. Set gistSync.gistId to this ID before retrying; no credentials uploaded.`,
+					);
+				}
+			}
+			const config = snapshot.gistSync as GistSyncConfig;
+			const base =
+				snapshot.gistSyncState?.gistId === config.gistId
+					? snapshot.gistSyncState.accounts
+					: [];
+			const synced = await syncGist(config, base, snapshot.accounts);
+			const release = lockFile(storageFile);
+			try {
+				const disk = normalizeStorageData(
+					JSON.parse(fs.readFileSync(storageFile, "utf8")),
+				);
+				if (disk.gistSync?.gistId !== config.gistId) {
+					throw new Error(
+						"Gist configuration changed during sync; local accounts not modified.",
+					);
+				}
+				// A login or refresh may have completed while Git was in flight.
+				const localUsage = new Map(
+					disk.accounts.map((a) => [a.email, a.lastUsed]),
+				);
+				disk.accounts = mergeAccounts(
+					snapshot.accounts,
+					disk.accounts,
+					synced,
+				).map((a) => ({ ...a, lastUsed: localUsage.get(a.email) }));
+				disk.gistSyncState = {
+					gistId: config.gistId,
+					accounts: sharedAccounts(synced),
+				};
+				disk.gistSyncStatus = { lastSuccess: Date.now() };
+				atomicWrite(storageFile, disk);
+				this.data = disk;
+				this.baseline = structuredClone(disk);
+			} finally {
+				release();
+			}
+		} finally {
+			releaseSync();
 		}
 	}
 
@@ -1305,6 +1545,7 @@ export class AccountManager {
 			this.data = normalizeStorageData(
 				JSON.parse(fs.readFileSync(storageFile, "utf-8")),
 			);
+			this.baseline = structuredClone(this.data);
 			logMulticodex("storage.reload.success", {
 				accounts: this.data.accounts.length,
 				activeEmail: this.data.activeEmail,
@@ -1325,19 +1566,13 @@ export class AccountManager {
 		target.lastUsed = source.lastUsed;
 	}
 
-	private getOrAttachAccount(account: Account): Account {
-		const current = this.getAccount(account.email);
-		if (current) return current;
-		this.data.accounts.push(account);
-		logMulticodex("account.attach_missing", { email: account.email });
-		return account;
-	}
-
 	private async refreshTokenWithLocks(account: Account): Promise<string> {
 		const releaseLock = await acquireTokenRefreshLock(account.email);
 		try {
-			this.tryReloadFromDisk();
-			const current = this.getOrAttachAccount(account);
+			if (!this.tryReloadFromDisk())
+				throw new Error("Cannot read accounts before token refresh");
+			let current = this.getAccount(account.email);
+			if (!current) throw new Error("Account removed before token refresh");
 			if (current !== account) {
 				this.syncAccountFields(account, current);
 			}
@@ -1350,11 +1585,49 @@ export class AccountManager {
 				return current.accessToken;
 			}
 
+			if (this.data.gistSync?.gistId) {
+				try {
+					await this.pullAccounts();
+				} catch {
+					throw new Error(
+						"Could not pull shared credentials before token refresh. Local credentials unchanged; retry or run /multicodex-sync.",
+					);
+				}
+				if (!this.tryReloadFromDisk())
+					throw new Error("Cannot read accounts after credential pull");
+				const pulled = this.getAccount(account.email);
+				if (!pulled) throw new Error("Account removed during credential pull");
+				current = pulled;
+				this.syncAccountFields(account, current);
+				if (this.isAccessTokenFresh(current)) {
+					logMulticodex("token.refresh.skip_after_pull", {
+						email: current.email,
+					});
+					return current.accessToken;
+				}
+			}
+
 			logMulticodex("token.refresh.start", {
 				email: current.email,
 				expiresAt: current.expiresAt,
 			});
+			const beforeRefresh = structuredClone(current);
 			const result = await refreshOpenAICodexToken(current.refreshToken);
+			// Login/sync may replace the account during the network await. Do not
+			// resurrect removed accounts or overwrite a different credential lineage.
+			if (!this.tryReloadFromDisk())
+				throw new Error("Cannot read accounts after token refresh");
+			const latest = this.getAccount(account.email);
+			if (!latest) throw new Error("Account removed during token refresh");
+			if (
+				latest.refreshToken !== beforeRefresh.refreshToken ||
+				latest.accessToken !== beforeRefresh.accessToken
+			) {
+				this.syncAccountFields(account, latest);
+				if (this.isAccessTokenFresh(latest)) return latest.accessToken;
+				throw new Error("Credentials changed during token refresh; retry");
+			}
+			current = latest;
 			current.accessToken = result.access;
 			current.refreshToken = result.refresh;
 			current.expiresAt = result.expires;
@@ -1381,10 +1654,16 @@ export class AccountManager {
 			throw error;
 		} finally {
 			releaseLock();
+			this.scheduleSync();
 		}
 	}
 
 	async ensureValidToken(account: Account): Promise<string> {
+		// References held by usage/stream callers can predate a login or sync.
+		this.tryReloadFromDisk();
+		const latest = this.getAccount(account.email);
+		if (!latest) throw new Error("Account no longer exists");
+		if (latest !== account) this.syncAccountFields(account, latest);
 		// Valid for at least 5 more mins
 		if (this.isAccessTokenFresh(account)) {
 			return account.accessToken;
@@ -1675,6 +1954,29 @@ export default function multicodexExtension(pi: ExtensionAPI) {
 		buildMulticodexProviderConfig(accountManager),
 	);
 
+	pi.registerCommand("multicodex-sync", {
+		description:
+			"Sync accounts with the secret Gist, or show /multicodex-sync status",
+		handler: async (
+			args: string,
+			ctx: ExtensionCommandContext,
+		): Promise<void> => {
+			if (args.trim() === "status") {
+				ctx.ui.notify(
+					`MultiCodex sync: ${accountManager.getSyncStatus(true)}`,
+					"info",
+				);
+				return;
+			}
+			try {
+				await accountManager.syncAccounts();
+				ctx.ui.notify("MultiCodex accounts synced.", "info");
+			} catch (error) {
+				ctx.ui.notify(`Sync failed: ${getErrorMessage(error)}`, "error");
+			}
+		},
+	});
+
 	// Login command
 	pi.registerCommand("multicodex-login", {
 		description: "Login to an OpenAI Codex account for the rotation pool",
@@ -1885,6 +2187,12 @@ export default function multicodexExtension(pi: ExtensionAPI) {
 	// Hooks
 	pi.on("session_start", (_event: unknown, ctx: ExtensionContext) => {
 		lastContext = ctx;
+		accountManager.startSync((status) =>
+			ctx.ui.setStatus(
+				"multicodex-sync",
+				status === "synced" ? undefined : `Multicodex sync: ${status}`,
+			),
+		);
 		if (accountManager.getAccounts().length === 0) return;
 		void (async () => {
 			await accountManager.refreshUsageForAllAccounts({ force: true });
@@ -1897,10 +2205,22 @@ export default function multicodexExtension(pi: ExtensionAPI) {
 		})();
 	});
 
+	pi.on("session_shutdown", () => {
+		accountManager.stopSync();
+		lastContext?.ui.setStatus("multicodex-sync", undefined);
+		lastContext = undefined;
+	});
+
 	pi.on(
 		"session_switch",
 		(event: { reason?: string }, ctx: ExtensionContext) => {
 			lastContext = ctx;
+			accountManager.startSync((status) =>
+				ctx.ui.setStatus(
+					"multicodex-sync",
+					status === "synced" ? undefined : `Multicodex sync: ${status}`,
+				),
+			);
 			if (event.reason === "new") {
 				void (async () => {
 					await accountManager.refreshUsageForAllAccounts({ force: true });

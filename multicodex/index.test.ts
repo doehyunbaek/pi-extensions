@@ -10,6 +10,8 @@ vi.mock("@mariozechner/pi-ai/oauth", () => ({
 	refreshOpenAICodexToken: vi.fn(),
 }));
 
+import { lockFile } from "./gist-sync";
+
 import {
 	type Account,
 	AccountManager,
@@ -311,7 +313,199 @@ describe("AccountManager token refresh", () => {
 		restoreEnv("MULTICODEX_LOG_FILE", previousLogFile);
 		restoreEnv("MULTICODEX_LOCK_DIR", previousLockDir);
 		vi.unstubAllGlobals();
+		vi.restoreAllMocks();
 		fs.rmSync(tempDir, { recursive: true, force: true });
+	});
+
+	function configureGist(): void {
+		vi.spyOn(AccountManager.prototype, "pullAccounts").mockResolvedValue();
+		const file = process.env.MULTICODEX_STORAGE_FILE as string;
+		const disk = JSON.parse(fs.readFileSync(file, "utf8"));
+		disk.gistSync = { gistId: "abc" };
+		fs.writeFileSync(file, JSON.stringify(disk));
+	}
+
+	it("uses pulled fresh credentials without rotating or pushing", async () => {
+		const manager = new AccountManager();
+		manager.addOrUpdateAccount("a", {
+			access: "old",
+			refresh: "old",
+			expires: 0,
+		});
+		configureGist();
+		vi.mocked(manager.pullAccounts).mockImplementation(async () => {
+			manager.addOrUpdateAccount("a", {
+				access: "remote",
+				refresh: "remote-refresh",
+				expires: Date.now() + 3_600_000,
+			});
+		});
+		const sync = vi.spyOn(manager, "syncAccounts").mockResolvedValue();
+		const account = manager.getAccount("a") as Account;
+		await expect(manager.ensureValidToken(account)).resolves.toBe("remote");
+		expect(account.refreshToken).toBe("remote-refresh");
+		expect(refreshTokenMock).not.toHaveBeenCalled();
+		expect(sync).not.toHaveBeenCalled();
+	});
+
+	it("refreshes with the pulled refresh token when remote access is also expired", async () => {
+		const manager = new AccountManager();
+		manager.addOrUpdateAccount("a", {
+			access: "old",
+			refresh: "old",
+			expires: 0,
+		});
+		configureGist();
+		vi.mocked(manager.pullAccounts).mockImplementation(async () => {
+			manager.addOrUpdateAccount("a", {
+				access: "remote",
+				refresh: "remote-refresh",
+				expires: 0,
+			});
+		});
+		vi.spyOn(manager, "syncAccounts").mockResolvedValue();
+		refreshTokenMock.mockResolvedValue({
+			access: "rotated",
+			refresh: "rotated",
+			expires: Date.now() + 3_600_000,
+		});
+		await expect(
+			manager.ensureValidToken(manager.getAccount("a") as Account),
+		).resolves.toBe("rotated");
+		expect(refreshTokenMock).toHaveBeenCalledWith("remote-refresh");
+	});
+
+	it("fails closed without OAuth rotation when pulling fails", async () => {
+		const manager = new AccountManager();
+		manager.addOrUpdateAccount("a", {
+			access: "old",
+			refresh: "old",
+			expires: 0,
+		});
+		configureGist();
+		vi.mocked(manager.pullAccounts).mockRejectedValue(new Error("offline"));
+		await expect(
+			manager.ensureValidToken(manager.getAccount("a") as Account),
+		).rejects.toThrow("Could not pull shared credentials");
+		expect(refreshTokenMock).not.toHaveBeenCalled();
+		expect(manager.getAccount("a")?.refreshToken).toBe("old");
+	});
+
+	it("syncs saved rotated credentials in the background without holding the refresh lock", async () => {
+		const manager = new AccountManager();
+		manager.addOrUpdateAccount("a", {
+			access: "old",
+			refresh: "old",
+			expires: 0,
+		});
+		configureGist();
+		let finish!: () => void;
+		const sync = vi.spyOn(manager, "syncAccounts").mockImplementation(() => {
+			const disk = JSON.parse(
+				fs.readFileSync(process.env.MULTICODEX_STORAGE_FILE as string, "utf8"),
+			);
+			expect(disk.accounts[0].refreshToken).toBe("rotated");
+			const release = lockFile(
+				path.join(process.env.MULTICODEX_LOCK_DIR as string, "token-refresh"),
+			);
+			release();
+			return new Promise<void>((resolve) => {
+				finish = resolve;
+			});
+		});
+		manager.startSync();
+		refreshTokenMock.mockResolvedValue({
+			access: "rotated",
+			refresh: "rotated",
+			expires: Date.now() + 3_600_000,
+		});
+		await expect(
+			manager.ensureValidToken(manager.getAccount("a") as Account),
+		).resolves.toBe("rotated");
+		await vi.waitFor(() => expect(sync).toHaveBeenCalledTimes(1));
+		manager.stopSync();
+		finish();
+		await Promise.resolve();
+	});
+
+	it("does not enable Gist sync implicitly on token refresh", async () => {
+		const manager = new AccountManager();
+		manager.addOrUpdateAccount("a", {
+			access: "old",
+			refresh: "old",
+			expires: 0,
+		});
+		const sync = vi.spyOn(manager, "syncAccounts").mockResolvedValue();
+		refreshTokenMock.mockResolvedValue({
+			access: "rotated",
+			refresh: "rotated",
+			expires: Date.now() + 3_600_000,
+		});
+		await manager.ensureValidToken(manager.getAccount("a") as Account);
+		expect(sync).not.toHaveBeenCalled();
+	});
+
+	it("does not fail the refreshed token when background sync fails", async () => {
+		const manager = new AccountManager();
+		manager.addOrUpdateAccount("a", {
+			access: "old",
+			refresh: "old",
+			expires: 0,
+		});
+		configureGist();
+		const sync = vi
+			.spyOn(manager, "syncAccounts")
+			.mockRejectedValue(new Error("offline"));
+		manager.startSync();
+		refreshTokenMock.mockResolvedValue({
+			access: "rotated",
+			refresh: "rotated",
+			expires: Date.now() + 3_600_000,
+		});
+		await expect(
+			manager.ensureValidToken(manager.getAccount("a") as Account),
+		).resolves.toBe("rotated");
+		await vi.waitFor(() => expect(sync).toHaveBeenCalledTimes(1));
+		manager.stopSync();
+		expect(manager.getAccount("a")?.refreshToken).toBe("rotated");
+	});
+
+	it("queues another pass when a token refresh occurs during a background sync", async () => {
+		const manager = new AccountManager();
+		manager.addOrUpdateAccount("a", {
+			access: "old",
+			refresh: "old",
+			expires: 0,
+		});
+		manager.addOrUpdateAccount("b", {
+			access: "old-b",
+			refresh: "old-b",
+			expires: 0,
+		});
+		configureGist();
+		let finish!: () => void;
+		const sync = vi
+			.spyOn(manager, "syncAccounts")
+			.mockImplementationOnce(
+				() =>
+					new Promise<void>((resolve) => {
+						finish = resolve;
+					}),
+			)
+			.mockResolvedValue();
+		refreshTokenMock.mockResolvedValue({
+			access: "rotated",
+			refresh: "rotated",
+			expires: Date.now() + 3_600_000,
+		});
+		manager.startSync();
+		await manager.ensureValidToken(manager.getAccount("a") as Account);
+		await vi.waitFor(() => expect(sync).toHaveBeenCalledTimes(1));
+		await manager.ensureValidToken(manager.getAccount("b") as Account);
+		expect(sync).toHaveBeenCalledTimes(1);
+		finish();
+		await vi.waitFor(() => expect(sync).toHaveBeenCalledTimes(2));
+		manager.stopSync();
 	});
 
 	it("deduplicates concurrent refreshes for the same account", async () => {
@@ -409,6 +603,41 @@ describe("AccountManager token refresh", () => {
 		]);
 		expect(refreshTokenMock).toHaveBeenCalledTimes(1);
 		expect(accountB?.refreshToken).toBe("new-refresh");
+	});
+
+	it("does not overwrite a login completed during token refresh", async () => {
+		const manager = new AccountManager();
+		manager.addOrUpdateAccount("a", {
+			access: "old",
+			refresh: "old",
+			expires: 0,
+		});
+		const account = manager.getAccount("a") as Account;
+		let finish!: (value: RefreshTokenResult) => void;
+		let started!: () => void;
+		const ready = new Promise<void>((resolve) => {
+			started = resolve;
+		});
+		refreshTokenMock.mockImplementation(() => {
+			started();
+			return new Promise((resolve) => {
+				finish = resolve;
+			});
+		});
+		const pending = manager.ensureValidToken(account);
+		await ready;
+		manager.addOrUpdateAccount("a", {
+			access: "login",
+			refresh: "login",
+			expires: Date.now() + 3_600_000,
+		});
+		finish({
+			access: "stale-result",
+			refresh: "stale-result",
+			expires: Date.now() + 3_600_000,
+		});
+		await expect(pending).resolves.toBe("login");
+		expect(manager.getAccount("a")?.refreshToken).toBe("login");
 	});
 
 	it("lists and consumes reset credits through the Codex backend", async () => {
