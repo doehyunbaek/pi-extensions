@@ -43,6 +43,7 @@ declare module "@mariozechner/pi-coding-agent" {
 	export interface ExtensionContext {
 		ui: ExtensionUI;
 		mode?: "tui" | "rpc" | "json" | "print";
+		modelRegistry?: { getAll(): Model<Api>[] };
 	}
 
 	export interface ExtensionCommandContext extends ExtensionContext {}
@@ -73,6 +74,22 @@ declare module "@mariozechner/pi-coding-agent" {
 					context: Context,
 					options?: SimpleStreamOptions,
 				) => AssistantMessageEventStream;
+				refreshModels?: () => Promise<
+					Array<{
+						id: string;
+						name: string;
+						reasoning: boolean;
+						input: ("text" | "image")[];
+						cost: {
+							input: number;
+							output: number;
+							cacheRead: number;
+							cacheWrite: number;
+						};
+						contextWindow: number;
+						maxTokens: number;
+					}>
+				>;
 				models: Array<{
 					id: string;
 					name: string;

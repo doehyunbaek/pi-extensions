@@ -11,8 +11,7 @@ vi.mock("@mariozechner/pi-ai/oauth", () => ({
 }));
 
 import { lockFile } from "./gist-sync";
-
-import {
+import multicodexExtension, {
 	type Account,
 	AccountManager,
 	buildHeatmapWeeks,
@@ -200,6 +199,70 @@ describe("getOpenAICodexMirror", () => {
 });
 
 describe("buildMulticodexProviderConfig", () => {
+	it("re-registers from the session registry, excluding other providers", () => {
+		const startSync = vi
+			.spyOn(AccountManager.prototype, "startSync")
+			.mockImplementation(() => {});
+		const getAccounts = vi
+			.spyOn(AccountManager.prototype, "getAccounts")
+			.mockReturnValue([]);
+		try {
+			const registerProvider = vi.fn();
+			const on = vi.fn();
+			multicodexExtension({
+				registerProvider,
+				on,
+				registerCommand: vi.fn(),
+			} as unknown as Parameters<typeof multicodexExtension>[0]);
+			const template = getModels("openai-codex")[0];
+			const models = [
+				{ ...template, id: "gpt-6.2-sol" },
+				{ ...template, id: "gpt-6.2-astra" },
+				{ ...template, provider: "other", id: "unrelated" },
+			];
+			const sessionStart = on.mock.calls.find(
+				([event]) => event === "session_start",
+			)?.[1];
+			sessionStart({}, { modelRegistry: { getAll: () => models }, ui: {} });
+			expect(registerProvider).toHaveBeenCalledTimes(2);
+			expect(
+				registerProvider.mock.lastCall?.[1].models.map(
+					(model: { id: string }) => model.id,
+				),
+			).toEqual(["gpt-6.2-sol", "gpt-6.2-astra"]);
+		} finally {
+			startSync.mockRestore();
+			getAccounts.mockRestore();
+		}
+	});
+
+	it("reads the runtime catalog again on refresh, including new models", async () => {
+		const template = getModels("openai-codex")[0];
+		let models = [{ ...template, id: "gpt-6.1-sol" }];
+		const config = buildMulticodexProviderConfig(
+			{} as AccountManager,
+			() => models,
+		);
+		expect(config.models.map((model) => model.id)).toEqual(["gpt-6.1-sol"]);
+
+		models = [
+			...models,
+			{ ...template, id: "gpt-6.2-sol", contextWindow: 256000 },
+			{ ...template, id: "gpt-6.2-astra", reasoning: true },
+		];
+		expect(await config.refreshModels()).toEqual(
+			getOpenAICodexMirror(models).models,
+		);
+		expect((await config.refreshModels()).map((model) => model.id)).toEqual([
+			"gpt-6.1-sol",
+			"gpt-6.2-sol",
+			"gpt-6.2-astra",
+		]);
+
+		models = [];
+		expect(await config.refreshModels()).toEqual([]);
+	});
+
 	it("uses mirrored models and baseUrl", () => {
 		const mirror = getOpenAICodexMirror();
 		const config = buildMulticodexProviderConfig(

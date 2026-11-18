@@ -398,11 +398,12 @@ function getThinkingLevelMap(model: Model<Api>): ThinkingLevelMap | undefined {
 		.thinkingLevelMap;
 }
 
-export function getOpenAICodexMirror(): {
+export function getOpenAICodexMirror(
+	sourceModels: readonly Model<Api>[] = getModels("openai-codex"),
+): {
 	baseUrl: string;
 	models: ProviderModelDef[];
 } {
-	const sourceModels = getModels("openai-codex");
 	return {
 		baseUrl: sourceModels[0]?.baseUrl || "https://chatgpt.com/backend-api",
 		models: sourceModels.map((m) => {
@@ -1912,7 +1913,11 @@ function createUsageHeatmapComponent(
 
 type ApiProviderRef = NonNullable<ReturnType<typeof getApiProvider>>;
 
-export function buildMulticodexProviderConfig(accountManager: AccountManager): {
+export function buildMulticodexProviderConfig(
+	accountManager: AccountManager,
+	getSourceModels: () => readonly Model<Api>[] = () =>
+		getModels("openai-codex"),
+): {
 	baseUrl: string;
 	apiKey: string;
 	api: MulticodexApi;
@@ -1922,8 +1927,9 @@ export function buildMulticodexProviderConfig(accountManager: AccountManager): {
 		options?: SimpleStreamOptions,
 	) => AssistantMessageEventStream;
 	models: ProviderModelDef[];
+	refreshModels: () => Promise<ProviderModelDef[]>;
 } {
-	const mirror = getOpenAICodexMirror();
+	const mirror = getOpenAICodexMirror(getSourceModels());
 	const baseProvider = getApiProvider(BASE_CODEX_API);
 	if (!baseProvider) {
 		throw new Error(
@@ -1936,6 +1942,7 @@ export function buildMulticodexProviderConfig(accountManager: AccountManager): {
 		api: MULTICODEX_API,
 		streamSimple: createStreamWrapper(accountManager, baseProvider),
 		models: mirror.models,
+		refreshModels: async () => getOpenAICodexMirror(getSourceModels()).models,
 	};
 }
 
@@ -1949,10 +1956,20 @@ export default function multicodexExtension(pi: ExtensionAPI) {
 		}
 	});
 
-	pi.registerProvider(
-		PROVIDER_ID,
-		buildMulticodexProviderConfig(accountManager),
-	);
+	// Static models bootstrap older Pi versions. Once a session exists, read its
+	// registry: this includes the persisted catalog from `pi update --models`.
+	const getSourceModels = () =>
+		lastContext?.modelRegistry
+			? lastContext.modelRegistry
+					.getAll()
+					.filter((model) => model.provider === "openai-codex")
+			: getModels("openai-codex");
+	const registerProvider = () =>
+		pi.registerProvider(
+			PROVIDER_ID,
+			buildMulticodexProviderConfig(accountManager, getSourceModels),
+		);
+	registerProvider();
 
 	pi.registerCommand("multicodex-sync", {
 		description:
@@ -2187,6 +2204,7 @@ export default function multicodexExtension(pi: ExtensionAPI) {
 	// Hooks
 	pi.on("session_start", (_event: unknown, ctx: ExtensionContext) => {
 		lastContext = ctx;
+		registerProvider();
 		accountManager.startSync((status) =>
 			ctx.ui.setStatus(
 				"multicodex-sync",
