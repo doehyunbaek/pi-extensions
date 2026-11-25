@@ -3,8 +3,9 @@ import { randomUUID } from "node:crypto";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import { createProvider, openAIResponsesApi } from "@earendil-works/pi-ai/compat";
-import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { parseCatalog, PROVIDER } from "./catalog.ts";
+import { AccessLoginRequired, accessLoginCommand, createAccessLogin, missingAccessToken } from "./cloudflare-access.ts";
 
 /** Reuse trusted global models.json endpoint/auth configuration; never write credentials. */
 export default async function (pi: ExtensionAPI) {
@@ -14,12 +15,42 @@ export default async function (pi: ExtensionAPI) {
     throw new Error(`codex-lb: configure ${PROVIDER}.baseUrl and apiKey in models.json first`);
   }
   const baseUrl: string = config.baseUrl.replace(/\/+$/, "");
+  const accessLogin = createAccessLogin();
+  let terminalUI: ExtensionContext["ui"] | undefined;
+  const loginWidget = "codex-lb-access-login";
+  pi.on("session_start", (_event, ctx) => {
+    if (ctx.mode === "tui") terminalUI = ctx.ui;
+  });
+  pi.on("session_shutdown", () => {
+    terminalUI?.setWidget(loginWidget, undefined);
+    terminalUI = undefined;
+    accessLogin.stop();
+  });
   // Commands originate only in the user's trusted global configuration.
-  async function resolve(value: string, signal: AbortSignal): Promise<string> {
+  async function resolve(value: string, signal: AbortSignal, accessHeader = false): Promise<string> {
     signal.throwIfAborted();
     if (value.startsWith("!")) {
       const result = await pi.exec("/bin/sh", ["-c", value.slice(1)], { signal, timeout: 15000, maxBuffer: 65536 });
-      if (result.code !== 0 || result.truncated) throw new Error("codex-lb: authentication command failed");
+      signal.throwIfAborted();
+      const login = accessHeader ? accessLoginCommand(value) : undefined;
+      if (login && missingAccessToken(result)) {
+        throw await accessLogin.request(login, terminalUI && (status => {
+          if (!terminalUI) return;
+          if (status.state === "link") {
+            const link = `\x1b]8;;${status.url}\x1b\\\x1b[4mSign in to Cloudflare Access\x1b[24m\x1b]8;;\x1b\\`;
+            terminalUI.setWidget(loginWidget, [link, "Open the link in your local browser, then retry your prompt."]);
+          } else if (status.state === "starting") {
+            terminalUI.setWidget(loginWidget, ["Cloudflare Access: waiting for a sign-in link…"]);
+          } else {
+            terminalUI.setWidget(loginWidget, undefined);
+            terminalUI.notify(status.state === "done" ? "Cloudflare Access sign-in complete. Retry your prompt." :
+              `Cloudflare Access sign-in ended. Retry or run ${login.join(" ")}.`, status.state === "done" ? "info" : "warning");
+          }
+        }));
+      }
+      if (result.code !== 0 || result.truncated || (login && !result.stdout.trim())) {
+        throw new Error("codex-lb: authentication command failed");
+      }
       return result.stdout.trim();
     }
     return value.replace(/\$\$|\$!|\$\{([A-Za-z_][A-Za-z_0-9]*)\}|\$([A-Za-z_][A-Za-z_0-9]*)/g,
@@ -30,7 +61,7 @@ export default async function (pi: ExtensionAPI) {
     if (!apiKey) throw new Error("codex-lb: API key is empty");
     const headers: Record<string, string> = {};
     for (const [name, value] of Object.entries(config.headers ?? {})) {
-      headers[name] = await resolve(String(value), signal);
+      headers[name] = await resolve(String(value), signal, name.toLowerCase() === "cf-access-token");
     }
     return { apiKey, headers };
   }
@@ -87,8 +118,9 @@ export default async function (pi: ExtensionAPI) {
         return true;
       },
     });
-  } catch {
+  } catch (error) {
     if (provider.getModels().length === 0) {
+      if (error instanceof AccessLoginRequired) throw error;
       throw new Error("codex-lb: discovery failed and no cached models are available; check gateway authentication");
     }
     // Keep the restored catalog when offline. Runtime refresh reports later failures.

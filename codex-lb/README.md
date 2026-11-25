@@ -50,6 +50,7 @@ No default provider, model, or thinking setting is changed by this extension.
 - Pi stores runtime catalogs in its model store. A separate atomic `codex-lb-models.json` snapshot in the agent directory supports early/offline startup before the registry is initialized. This startup snapshot is updated on successful startup discovery.
 - Failed requests, invalid catalogs, and empty catalogs do not replace a working catalog. First startup without either a reachable gateway or a valid snapshot reports an error.
 - Discovery has a 30-second deadline; auth commands have a 15-second deadline and honor cancellation. No background polling or timers are installed.
+- For a `cf-access-token` configured as `!cloudflared access token --app https://…` (a full executable path also works), a missing or expired token triggers a fresh Cloudflare login on the next use. On a desktop, `cloudflared` opens the browser; finish signing in and retry the failed Pi request. Over SSH or on a headless host, interactive Pi starts the login and shows a clickable **Sign in to Cloudflare Access** link above the prompt. Open it in your local browser, then retry. If your terminal cannot open the link, or you are using non-interactive Pi, use the login command shown in the error. The extension does not put the one-time URL in session history.
 - API keys and Cloudflare headers are resolved from existing configuration, not saved in either model cache. Never commit credentials. `!` commands in the trusted global config execute with your account permissions.
 
 ## Metadata policy
@@ -63,7 +64,7 @@ When metadata is absent, the client defaults are 128,000 context tokens and 16,3
 ## Tests
 
 ```bash
-node --experimental-strip-types --test codex-lb/catalog.test.ts
+node --experimental-strip-types --test codex-lb/*.test.ts
 ```
 
 The catalog tests are offline. Live model-list discovery has also been checked against the configured gateway. Streaming, image requests, and tool execution are delegated to Pi but have not been exercised as part of that discovery smoke test.
