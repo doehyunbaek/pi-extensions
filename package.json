@@ -2,14 +2,12 @@
   "name": "pi-extensions",
   "private": true,
   "workspaces": [
-    "multicodex",
     "litellm",
     "system-prompt",
     "autogist"
   ],
   "scripts": {
-    "check": "npm run check:multicodex && npm run check --workspace=pi-provider-litellm",
-    "check:multicodex": "npm run lint --workspace=pi-multicodex && npm test --workspace=pi-multicodex && npm run tsgo --workspace=pi-multicodex",
+    "check": "npm run check --workspace=pi-provider-litellm",
     "test": "npm test --workspaces --if-present",
     "lint": "npm run lint --workspaces --if-present",
     "typecheck": "npm run typecheck --workspaces --if-present"
@@ -26,7 +24,6 @@
   },
   "pi": {
     "extensions": [
-      "./multicodex/index.ts",
       "./litellm/index.ts",
       "./system-prompt/index.ts",
       "./autogist/index.ts"
