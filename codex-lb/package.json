@@ -1,0 +1,13 @@
+{
+  "name": "pi-provider-codex-lb",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "keywords": ["pi-package"],
+  "pi": { "extensions": ["./index.ts"] },
+  "scripts": { "test": "node --experimental-strip-types --test catalog.test.ts" },
+  "peerDependencies": {
+    "@earendil-works/pi-ai": ">=1.6.0",
+    "@earendil-works/pi-coding-agent": ">=1.6.0"
+  }
+}
