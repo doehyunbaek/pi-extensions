@@ -4,7 +4,8 @@
   "workspaces": [
     "litellm",
     "system-prompt",
-    "autogist"
+    "autogist",
+    "codex-lb"
   ],
   "scripts": {
     "check": "npm run check --workspace=pi-provider-litellm",
@@ -26,7 +27,8 @@
     "extensions": [
       "./litellm/index.ts",
       "./system-prompt/index.ts",
-      "./autogist/index.ts"
+      "./autogist/index.ts",
+      "./codex-lb/index.ts"
     ]
   }
 }

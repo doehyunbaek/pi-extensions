@@ -6,6 +6,14 @@ The directory/package is named `codex-lb`, but the provider ID remains **`doehyu
 
 ## Enable
 
+Install the repository package (includes this provider):
+
+```sh
+pi install https://github.com/doehyunbaek/pi-extensions
+```
+
+Use `pi config` to enable or disable individual extensions.
+
 Keep the endpoint and authentication in your trusted global `~/.pi/agent/models.json` (or `$PI_CODING_AGENT_DIR/models.json`):
 
 ```json
@@ -26,7 +34,7 @@ Keep the endpoint and authentication in your trusted global `~/.pi/agent/models.
 
 **Remove the provider's static `models` array** after backing up the file. Pi overlays `models.json` above extension models; old static definitions otherwise override discovered capabilities and retain retired models. Use `modelOverrides` only for deliberate per-model exceptions. Leave unrelated providers alone.
 
-Add this path to the `extensions` array in `~/.pi/agent/settings.json`, preserving other settings:
+For local development, instead of installing the repository package, add this path to the `extensions` array in `~/.pi/agent/settings.json`, preserving other settings (do not load both copies):
 
 ```json
 {
